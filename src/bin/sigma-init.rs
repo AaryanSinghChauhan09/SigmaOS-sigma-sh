@@ -7,6 +7,7 @@
 
 #![no_std]
 #![no_main]
+#![allow(static_mut_refs)]
 
 
 use sigma_sys as sys;
