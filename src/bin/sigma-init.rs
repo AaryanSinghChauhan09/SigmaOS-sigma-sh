@@ -92,13 +92,23 @@ pub extern "C" fn _start() -> ! {
             let _ = sys::api::print("spawned pid=");
             pdec(pid);
             let _ = sys::api::print("\n");
-            match sys::api::wait(pid) {
-                Ok(code) => {
-                    let _ = sys::api::print("wait status=");
-                    pdec(code as u64);
-                    let _ = sys::api::print("\n");
+            // Child is preemptively scheduled — WAIT may return
+            // EAGAIN until it exits; retry with a userspace spin
+            // (each retry is a syscall boundary the scheduler uses).
+            loop {
+                match sys::api::wait(pid) {
+                    Ok(code) => {
+                        let _ = sys::api::print("wait status=");
+                        pdec(code as u64);
+                        let _ = sys::api::print("\n");
+                        break;
+                    }
+                    Err(-11) => core::hint::spin_loop(), // EAGAIN: still running
+                    Err(e) => {
+                        perr(e);
+                        break;
+                    }
                 }
-                Err(e) => perr(e),
             }
         }
         Err(e) => perr(e),

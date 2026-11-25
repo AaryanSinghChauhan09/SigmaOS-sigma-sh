@@ -56,6 +56,17 @@ pub extern "C" fn _start() -> ! {
     let _ = sys::api::print("sigma-child: alive, pid=");
     pdec(sys::api::getpid().unwrap_or(0) as u64);
     let _ = sys::api::print("\n");
+    // Spin for a while so the timer IRQ preempts us and the parent
+    // gets scheduled — demonstrates preemptive context switching.
+    let mut i = 0u64;
+    while i < 20_000_000 {
+        i += 1;
+        if i % 5_000_000 == 0 {
+            let _ = sys::api::print("sigma-child: tick ");
+            pdec(i);
+            let _ = sys::api::print("\n");
+        }
+    }
     let _ = sys::api::print("sigma-child: exiting 42\n");
     sys::api::exit(42);
 }
