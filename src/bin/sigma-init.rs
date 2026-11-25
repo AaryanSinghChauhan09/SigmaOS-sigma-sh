@@ -86,7 +86,23 @@ pub extern "C" fn _start() -> ! {
     pdec(pid as u64);
     let _ = sys::api::print("\nsigma-init: idle (halt)\n");
 
-    run("mem"); // boot self-test: exercise BRK/MMAP syscalls
+    // boot self-test: SPAWN -> WAIT process lifecycle
+    match sys::api::spawn(b"/child") {
+        Ok(pid) => {
+            let _ = sys::api::print("spawned pid=");
+            pdec(pid);
+            let _ = sys::api::print("\n");
+            match sys::api::wait(pid) {
+                Ok(code) => {
+                    let _ = sys::api::print("wait status=");
+                    pdec(code as u64);
+                    let _ = sys::api::print("\n");
+                }
+                Err(e) => perr(e),
+            }
+        }
+        Err(e) => perr(e),
+    }
     shell();
 }
 
@@ -128,7 +144,7 @@ fn run(cmd: &str) {
     let mut it = cmd.split_whitespace();
     match it.next() {
         Some("help") | None => {
-            let _ = sys::api::print("commands: ls <dir> | cat <file> | ver | time | mem | exit\n");
+            let _ = sys::api::print("commands: ls <dir> | cat <file> | ver | time | mem | spawn [path] | wait <pid> | exit\n");
         }
         Some("ls") => {
             let path = it.next().unwrap_or("/");
@@ -218,6 +234,34 @@ fn run(cmd: &str) {
                     let _ = sys::api::print("mmap err ");
                     perr(e);
                 }
+            }
+        }
+        Some("spawn") => {
+            let path = it.next().unwrap_or("/child");
+            match sys::api::spawn(path.as_bytes()) {
+                Ok(pid) => {
+                    let _ = sys::api::print("spawned pid=");
+                    pdec(pid);
+                    let _ = sys::api::print("\n");
+                }
+                Err(e) => perr(e),
+            }
+        }
+        Some("wait") => {
+            let Some(ps) = it.next() else {
+                let _ = sys::api::print("usage: wait <pid>\n");
+                return;
+            };
+            let pid = ps.bytes().fold(0u64, |a, b| {
+                if b.is_ascii_digit() { a * 10 + (b - b'0') as u64 } else { a }
+            });
+            match sys::api::wait(pid) {
+                Ok(code) => {
+                    let _ = sys::api::print("wait: status=");
+                    pdec(code as u64);
+                    let _ = sys::api::print("\n");
+                }
+                Err(e) => perr(e),
             }
         }
         Some("ver") => {
