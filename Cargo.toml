@@ -37,5 +37,9 @@ path = "src/bin/pkg.rs"
 name = "kill"
 path = "src/bin/kill.rs"
 
+[[bin]]
+name = "mount"
+path = "src/bin/mount.rs"
+
 [dependencies]
 sigmaos-sigma-sys = { path = "../SigmaOS-sigma-sys", features = ["x86_64"] }
