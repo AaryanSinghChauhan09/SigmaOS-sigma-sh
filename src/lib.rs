@@ -171,6 +171,9 @@ where
             "time" | "uptime" => self.io.writeln(&format_u64(self.sys.uptime())),
             "launch" | "run" => self.cmd_launch(&cmd.args),
             "reboot" => self.sys.reboot(),
+            "jobs" => self.cmd_jobs(),
+            "fg" => self.cmd_fg(&cmd.args),
+            "bg" => self.cmd_bg(&cmd.args),
             _ => self.io.writeln(&format!("sigma-sh: {}: command not found", cmd.name)),
         }
     }
@@ -187,6 +190,9 @@ where
             "  ps              process list",
             "  time            uptime seconds",
             "  launch <prog>   run a program",
+            "  jobs            list background jobs",
+            "  fg <job>        bring job to foreground",
+            "  bg <job>        send job to background",
             "  reboot          restart the machine",
             "  exit            leave the shell",
         ] {
@@ -258,6 +264,21 @@ where
             Ok(pid) => self.io.writeln(&format!("launched {} (pid {})", prog, pid)),
             Err(e) => self.io.writeln(&format!("launch: {}: {}", prog, e)),
         }
+    }
+
+    /// Job control: list background jobs (stub for now)
+    fn cmd_jobs(&mut self) {
+        self.io.writeln("jobs: no background jobs (job control not implemented)");
+    }
+
+    /// Job control: bring job to foreground (stub for now)
+    fn cmd_fg(&mut self, _args: &[String]) {
+        self.io.writeln("fg: job control not implemented");
+    }
+
+    /// Job control: send job to background (stub for now)
+    fn cmd_bg(&mut self, _args: &[String]) {
+        self.io.writeln("bg: job control not implemented");
     }
 }
 
