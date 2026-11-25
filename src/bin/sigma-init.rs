@@ -55,36 +55,101 @@ pub extern "C" fn _start() -> ! {
     let _ = sys::api::print(&pid.to_string());
     let _ = sys::api::print("\nsigma-init: idle (halt)\n");
 
-    // Demo: open + read a file through the VFS syscalls.
-    match sys::api::open("/bin/sigma-sh", 0) {
-        Ok(fd) => {
-            let mut buf = [0u8; 8];
-            match sys::api::read(fd as i64, &mut buf) {
-                Ok(n) => {
-                    let _ = sys::api::print("sigma-init: read ");
-                    let _ = sys::api::print(&n.to_string());
-                    let _ = sys::api::print(" bytes, magic=");
-                    for &b in &buf[..n.min(4)] {
-                        let _ = sys::api::print(&b.to_string());
-                        let _ = sys::api::print(" ");
+    shell();
+}
+
+fn shell() -> ! {
+    let _ = sys::api::print("sigma-init: type 'help'\n");
+    let mut line = [0u8; 96];
+    loop {
+        let _ = sys::api::print("sigma$ ");
+        // read a line via fd0 (PS/2 keyboard -> kernel)
+        let mut n = 0usize;
+        loop {
+            let mut b = [0u8; 1];
+            match sys::api::read(0, &mut b) {
+                Ok(1) => {
+                    let c = b[0];
+                    if c == b'\n' {
+                        let _ = sys::api::write(1, b"\n");
+                        break;
+                    } else if c == 0x7f {
+                        if n > 0 {
+                            n -= 1;
+                            let _ = sys::api::write(1, b"\x08 \x08");
+                        }
+                    } else if n < line.len() {
+                        line[n] = c;
+                        n += 1;
+                        let _ = sys::api::write(1, &b);
                     }
+                }
+                _ => core::hint::spin_loop(),
+            }
+        }
+        let cmd = core::str::from_utf8(&line[..n]).unwrap_or("").trim();
+        run(cmd);
+    }
+}
+
+fn run(cmd: &str) {
+    let mut it = cmd.split_whitespace();
+    match it.next() {
+        Some("help") | None => {
+            let _ = sys::api::print("commands: ls <dir> | cat <file> | mem | exit\n");
+        }
+        Some("ls") => {
+            let path = it.next().unwrap_or("/");
+            let mut buf = [0u8; 512];
+            match sys::api::listdir(path, &mut buf) {
+                Ok(n) => {
+                    let _ = sys::api::write(1, &buf[..n]);
                     let _ = sys::api::print("\n");
                 }
                 Err(e) => {
-                    let _ = sys::api::print("sigma-init: read err ");
+                    let _ = sys::api::print("ls: err ");
                     let _ = sys::api::print(&e.to_string());
                     let _ = sys::api::print("\n");
                 }
             }
-            let _ = sys::api::close(fd as i64);
         }
-        Err(e) => {
-            let _ = sys::api::print("sigma-init: open err ");
-            let _ = sys::api::print(&e.to_string());
-            let _ = sys::api::print("\n");
+        Some("cat") => {
+            let Some(path) = it.next() else {
+                let _ = sys::api::print("usage: cat <file>\n");
+                return;
+            };
+            match sys::api::open(path, 0) {
+                Ok(fd) => {
+                    let mut buf = [0u8; 256];
+                    loop {
+                        match sys::api::read(fd, &mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                let _ = sys::api::write(1, &buf[..n]);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let _ = sys::api::close(fd);
+                }
+                Err(e) => {
+                    let _ = sys::api::print("cat: err ");
+                    let _ = sys::api::print(&e.to_string());
+                    let _ = sys::api::print("\n");
+                }
+            }
         }
-    }
-    loop {
-        core::hint::spin_loop();
+        Some("mem") => {
+            let _ = sys::api::print("sigma-init: kernel owns the memory map\n");
+        }
+        Some("exit") => {
+            let _ = sys::api::print("sigma-init: bye\n");
+            sys::api::exit(0);
+        }
+        Some(other) => {
+            let _ = sys::api::print("unknown: ");
+            let _ = sys::api::print(other);
+            let _ = sys::api::print(" (try 'help')\n");
+        }
     }
 }
