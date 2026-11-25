@@ -96,7 +96,7 @@ fn run(cmd: &str) {
     let mut it = cmd.split_whitespace();
     match it.next() {
         Some("help") | None => {
-            let _ = sys::api::print("commands: ls <dir> | cat <file> | mem | exit\n");
+            let _ = sys::api::print("commands: ls <dir> | cat <file> | ver | time | mem | exit\n");
         }
         Some("ls") => {
             let path = it.next().unwrap_or("/");
@@ -141,6 +141,34 @@ fn run(cmd: &str) {
         }
         Some("mem") => {
             let _ = sys::api::print("sigma-init: kernel owns the memory map\n");
+        }
+        Some("ver") => {
+            match sys::api::kernel_version() {
+                Ok(v) => {
+                    let _ = sys::api::print("kernel ");
+                    let _ = sys::api::print(&v);
+                    let _ = sys::api::print("\n");
+                }
+                Err(e) => {
+                    let _ = sys::api::print("ver err ");
+                    let _ = sys::api::print(&e.to_string());
+                    let _ = sys::api::print("\n");
+                }
+            }
+        }
+        Some("time") => {
+            match sys::api::time() {
+                Ok(t) => {
+                    let _ = sys::api::print("ticks=");
+                    let _ = sys::api::print(&t.to_string());
+                    let _ = sys::api::print("\n");
+                }
+                Err(e) => {
+                    let _ = sys::api::print("time err ");
+                    let _ = sys::api::print(&e.to_string());
+                    let _ = sys::api::print("\n");
+                }
+            }
         }
         Some("exit") => {
             let _ = sys::api::print("sigma-init: bye\n");
