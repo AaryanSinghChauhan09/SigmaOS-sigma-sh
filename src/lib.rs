@@ -68,6 +68,12 @@ pub struct Command {
     pub args: Vec<String>,
 }
 
+/// A pipeline of commands connected by pipes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pipeline {
+    pub commands: Vec<Command>,
+}
+
 /// Tokenize a command line: whitespace-separated, double-quote aware.
 pub fn parse(line: &str) -> Option<Command> {
     let mut chars = line.chars().peekable();
@@ -105,6 +111,20 @@ pub fn parse(line: &str) -> Option<Command> {
         args.push(cur);
     }
     Some(Command { name, args })
+}
+
+/// Parse a pipeline (commands separated by |).
+pub fn parse_pipeline(line: &str) -> Option<Pipeline> {
+    let commands: Vec<Command> = line
+        .split('|')
+        .filter_map(|part| parse(part))
+        .collect();
+    
+    if commands.is_empty() {
+        None
+    } else {
+        Some(Pipeline { commands })
+    }
 }
 
 /// The shell.
@@ -156,9 +176,52 @@ where
 
     /// Execute one command line.
     pub fn execute(&mut self, line: &str) {
+        // Try to parse as pipeline first
+        if let Some(pipeline) = parse_pipeline(line) {
+            self.execute_pipeline(&pipeline);
+            return;
+        }
+        
+        // Fall back to single command
         let Some(cmd) = parse(line) else {
             return;
         };
+        match cmd.name.as_str() {
+            "help" | "?" => self.cmd_help(),
+            "exit" | "logout" | "quit" => self.running = false,
+            "echo" => self.io.writeln(&cmd.args.join(" ")),
+            "pwd" => self.io.writeln(&self.cwd),
+            "ls" => self.cmd_ls(&cmd.args),
+            "cat" => self.cmd_cat(&cmd.args),
+            "mem" => self.cmd_mem(),
+            "ps" => self.cmd_ps(),
+            "time" | "uptime" => self.io.writeln(&format_u64(self.sys.uptime())),
+            "launch" | "run" => self.cmd_launch(&cmd.args),
+            "reboot" => self.sys.reboot(),
+            "jobs" => self.cmd_jobs(),
+            "fg" => self.cmd_fg(&cmd.args),
+            "bg" => self.cmd_bg(&cmd.args),
+            _ => self.io.writeln(&format!("sigma-sh: {}: command not found", cmd.name)),
+        }
+    }
+
+    /// Execute a pipeline of commands.
+    pub fn execute_pipeline(&mut self, pipeline: &Pipeline) {
+        // Note: Full pipeline implementation requires:
+        // - Process spawning with pipe creation
+        // - Pipe file descriptor management
+        // - Connecting stdout of one command to stdin of next
+        // - Waiting for all processes in pipeline
+        // For now, this is a stub that executes commands sequentially
+        for cmd in &pipeline.commands {
+            self.io.writeln(&format!("sigma-sh: pipeline: executing {}", cmd.name));
+            // Execute each command in sequence (no real piping yet)
+            self.execute_single_command(cmd);
+        }
+    }
+
+    /// Execute a single command (helper for pipelines).
+    fn execute_single_command(&mut self, cmd: &Command) {
         match cmd.name.as_str() {
             "help" | "?" => self.cmd_help(),
             "exit" | "logout" | "quit" => self.running = false,
