@@ -117,7 +117,7 @@ pub fn parse(line: &str) -> Option<Command> {
 pub fn parse_pipeline(line: &str) -> Option<Pipeline> {
     let commands: Vec<Command> = line
         .split('|')
-        .filter_map(|part| parse(part))
+        .filter_map(parse)
         .collect();
     
     if commands.is_empty() {
@@ -346,8 +346,7 @@ where
 }
 
 fn format_u64(v: u64) -> String {
-    let s = v.to_string();
-    s
+    v.to_string()
 }
 
 #[cfg(test)]
@@ -424,6 +423,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn shell(lines: &[&str]) -> (Shell<TestIo, TestFs, TestProcs, TestMem, TestSys>, Rc<RefCell<String>>) {
         let out = Rc::new(RefCell::new(String::new()));
         let launched = Rc::new(RefCell::new(Vec::new()));

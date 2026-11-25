@@ -9,6 +9,10 @@ description = "SigmaOS rescue shell — minimal command interpreter for boot deb
 name = "sigma_sh"
 path = "src/lib.rs"
 
+[features]
+default = []
+sigmaos-target = []
+
 [[bin]]
 name = "sigma-sh"
 path = "src/bin/sigma-sh.rs"
@@ -16,30 +20,50 @@ path = "src/bin/sigma-sh.rs"
 [[bin]]
 name = "sigma-init"
 path = "src/bin/sigma-init.rs"
+test = false
+required-features = ["sigmaos-target"]
 
 [[bin]]
 name = "ls"
 path = "src/bin/ls.rs"
+test = false
+required-features = ["sigmaos-target"]
 
 [[bin]]
 name = "cat"
 path = "src/bin/cat.rs"
+test = false
+required-features = ["sigmaos-target"]
 
 [[bin]]
 name = "ps"
 path = "src/bin/ps.rs"
+test = false
+required-features = ["sigmaos-target"]
 
 [[bin]]
 name = "pkg"
 path = "src/bin/pkg.rs"
+test = false
+required-features = ["sigmaos-target"]
 
 [[bin]]
 name = "kill"
 path = "src/bin/kill.rs"
+test = false
+required-features = ["sigmaos-target"]
 
 [[bin]]
 name = "mount"
 path = "src/bin/mount.rs"
+test = false
+required-features = ["sigmaos-target"]
+
+[[bin]]
+name = "sigma-child"
+path = "src/bin/sigma-child.rs"
+test = false
+required-features = ["sigmaos-target"]
 
 [dependencies]
 sigmaos-sigma-sys = { path = "../SigmaOS-sigma-sys", features = ["x86_64"] }

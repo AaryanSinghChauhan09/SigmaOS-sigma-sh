@@ -5,12 +5,13 @@
 
 #![no_std]
 #![no_main]
+#![allow(dead_code)]
 
 extern crate alloc;
 extern crate sigma_sys;
 
 use alloc::string::String;
-use sigma_sys::{print, listdir, open, read, close};
+use sigma_sys::print;
 
 struct PkgCommand {
     name: String,

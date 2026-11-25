@@ -4,12 +4,13 @@
 
 #![no_std]
 #![no_main]
+#![allow(dead_code)]
 
 extern crate alloc;
 extern crate sigma_sys;
 
 use alloc::string::String;
-use sigma_sys::{print, getpid};
+use sigma_sys::print;
 
 /// Signal constants.
 const SIGTERM: u64 = 15;
