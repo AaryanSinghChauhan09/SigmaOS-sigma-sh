@@ -10,4 +10,4 @@ name = "sigma_sh"
 path = "src/lib.rs"
 
 [dependencies]
-sigmaos-sigma-sys = { path = "../SigmaOS-sigma-sys" }
+sigmaos-sigma-sys = { path = "../SigmaOS-sigma-sys", features = ["x86_64"] }
