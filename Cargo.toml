@@ -9,5 +9,33 @@ description = "SigmaOS rescue shell — minimal command interpreter for boot deb
 name = "sigma_sh"
 path = "src/lib.rs"
 
+[[bin]]
+name = "sigma-sh"
+path = "src/bin/sigma-sh.rs"
+
+[[bin]]
+name = "sigma-init"
+path = "src/bin/sigma-init.rs"
+
+[[bin]]
+name = "ls"
+path = "src/bin/ls.rs"
+
+[[bin]]
+name = "cat"
+path = "src/bin/cat.rs"
+
+[[bin]]
+name = "ps"
+path = "src/bin/ps.rs"
+
+[[bin]]
+name = "pkg"
+path = "src/bin/pkg.rs"
+
+[[bin]]
+name = "kill"
+path = "src/bin/kill.rs"
+
 [dependencies]
 sigmaos-sigma-sys = { path = "../SigmaOS-sigma-sys", features = ["x86_64"] }
