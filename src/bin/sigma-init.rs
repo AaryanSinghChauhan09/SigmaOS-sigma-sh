@@ -54,6 +54,36 @@ pub extern "C" fn _start() -> ! {
     let _ = sys::api::print("sigma-init: pid=");
     let _ = sys::api::print(&pid.to_string());
     let _ = sys::api::print("\nsigma-init: idle (halt)\n");
+
+    // Demo: open + read a file through the VFS syscalls.
+    match sys::api::open("/bin/sigma-sh", 0) {
+        Ok(fd) => {
+            let mut buf = [0u8; 8];
+            match sys::api::read(fd as i64, &mut buf) {
+                Ok(n) => {
+                    let _ = sys::api::print("sigma-init: read ");
+                    let _ = sys::api::print(&n.to_string());
+                    let _ = sys::api::print(" bytes, magic=");
+                    for &b in &buf[..n.min(4)] {
+                        let _ = sys::api::print(&b.to_string());
+                        let _ = sys::api::print(" ");
+                    }
+                    let _ = sys::api::print("\n");
+                }
+                Err(e) => {
+                    let _ = sys::api::print("sigma-init: read err ");
+                    let _ = sys::api::print(&e.to_string());
+                    let _ = sys::api::print("\n");
+                }
+            }
+            let _ = sys::api::close(fd as i64);
+        }
+        Err(e) => {
+            let _ = sys::api::print("sigma-init: open err ");
+            let _ = sys::api::print(&e.to_string());
+            let _ = sys::api::print("\n");
+        }
+    }
     loop {
         core::hint::spin_loop();
     }
