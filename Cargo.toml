@@ -1,0 +1,13 @@
+[package]
+name = "sigmaos-sigma-sh"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "SigmaOS rescue shell — minimal command interpreter for boot debugging"
+
+[lib]
+name = "sigma_sh"
+path = "src/lib.rs"
+
+[dependencies]
+sigmaos-sigma-sys = { path = "../SigmaOS-sigma-sys" }

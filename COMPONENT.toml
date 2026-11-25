@@ -1,0 +1,9 @@
+[component]
+name = "sigmaos-sigma-sh"
+version = "0.1.0"
+description = "Rescue shell with builtins (ls, ps, mem, reboot, launch) for boot debugging"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+sigmaos-sigma-sys = "0.1"
+sigmaos-sigma-kernel = "0.1"
