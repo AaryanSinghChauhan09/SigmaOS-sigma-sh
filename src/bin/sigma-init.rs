@@ -8,10 +8,41 @@
 #![no_std]
 #![no_main]
 
-extern crate alloc;
 
 use sigma_sys as sys;
-use alloc::string::ToString;
+
+/// Print a u64 in decimal — stack buffer only, no allocator.
+fn pdec(mut v: u64) {
+    let mut b = [0u8; 20];
+    let mut i = b.len();
+    if v == 0 {
+        i -= 1;
+        b[i] = b'0';
+    }
+    while v > 0 {
+        i -= 1;
+        b[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    let _ = sys::api::write(1, &b[i..]);
+}
+
+/// Print a u64 as 16 hex digits — stack buffer only, no allocator.
+fn phex(v: u64) {
+    let mut b = [0u8; 16];
+    for i in 0..16 {
+        let d = ((v >> ((15 - i) * 4)) & 0xf) as u8;
+        b[i] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
+    }
+    let _ = sys::api::write(1, &b);
+}
+
+/// Print a syscall error code.
+fn perr(e: i64) {
+    let _ = sys::api::print("err ");
+    pdec(e as u64);
+    let _ = sys::api::print("\n");
+}
 
 use core::alloc::{GlobalAlloc, Layout};
 
@@ -52,9 +83,10 @@ pub extern "C" fn _start() -> ! {
     let _ = sys::api::print("sigma-init: PID 1 alive\n");
     let pid = sys::api::getpid().unwrap_or(-1);
     let _ = sys::api::print("sigma-init: pid=");
-    let _ = sys::api::print(&pid.to_string());
+    pdec(pid as u64);
     let _ = sys::api::print("\nsigma-init: idle (halt)\n");
 
+    run("mem"); // boot self-test: exercise BRK/MMAP syscalls
     shell();
 }
 
@@ -108,8 +140,7 @@ fn run(cmd: &str) {
                 }
                 Err(e) => {
                     let _ = sys::api::print("ls: err ");
-                    let _ = sys::api::print(&e.to_string());
-                    let _ = sys::api::print("\n");
+                    perr(e);
                 }
             }
         }
@@ -134,13 +165,53 @@ fn run(cmd: &str) {
                 }
                 Err(e) => {
                     let _ = sys::api::print("cat: err ");
-                    let _ = sys::api::print(&e.to_string());
-                    let _ = sys::api::print("\n");
+                    perr(e);
                 }
             }
         }
         Some("mem") => {
-            let _ = sys::api::print("sigma-init: kernel owns the memory map\n");
+            // Exercise BRK: query, grow one page, touch it, report.
+            match sys::api::brk(0) {
+                Ok(cur) => {
+                    let _ = sys::api::print("brk: cur=0x");
+                    phex(cur);
+                    let new = cur + 0x1000;
+                    match sys::api::brk(new) {
+                        Ok(nb) => {
+                            let _ = sys::api::print(" grew=0x");
+                            phex(nb);
+                            // SAFETY: nb-0x1000..nb is freshly mapped
+                            // anonymous memory owned by this process.
+                            unsafe {
+                                *((nb - 1) as *mut u8) = 0x5a;
+                            }
+                            let v = unsafe { *((nb - 1) as *mut u8) };
+                            let _ = sys::api::print(" last=");
+                            pdec(v as u64);
+                            let _ = sys::api::print("\n");
+                        }
+                        Err(e) => {
+                            let _ = sys::api::print("brk grow err ");
+                            perr(e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = sys::api::print("brk err ");
+                    perr(e);
+                }
+            }
+            match sys::api::mmap(0, 0x2000) {
+                Ok(a) => {
+                    let _ = sys::api::print("mmap: base=0x");
+                    phex(a);
+                    let _ = sys::api::print("\n");
+                }
+                Err(e) => {
+                    let _ = sys::api::print("mmap err ");
+                    perr(e);
+                }
+            }
         }
         Some("ver") => {
             match sys::api::kernel_version() {
@@ -151,8 +222,7 @@ fn run(cmd: &str) {
                 }
                 Err(e) => {
                     let _ = sys::api::print("ver err ");
-                    let _ = sys::api::print(&e.to_string());
-                    let _ = sys::api::print("\n");
+                    perr(e);
                 }
             }
         }
@@ -160,13 +230,12 @@ fn run(cmd: &str) {
             match sys::api::time() {
                 Ok(t) => {
                     let _ = sys::api::print("ticks=");
-                    let _ = sys::api::print(&t.to_string());
+                    pdec(t);
                     let _ = sys::api::print("\n");
                 }
                 Err(e) => {
                     let _ = sys::api::print("time err ");
-                    let _ = sys::api::print(&e.to_string());
-                    let _ = sys::api::print("\n");
+                    perr(e);
                 }
             }
         }
