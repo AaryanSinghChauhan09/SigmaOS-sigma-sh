@@ -205,6 +205,13 @@ fn run(cmd: &str) {
                 Ok(a) => {
                     let _ = sys::api::print("mmap: base=0x");
                     phex(a);
+                    match sys::api::munmap(a, 0x2000) {
+                        Ok(r) => {
+                            let _ = sys::api::print(" munmap=0x");
+                            phex(r);
+                        }
+                        Err(e) => perr(e),
+                    }
                     let _ = sys::api::print("\n");
                 }
                 Err(e) => {
