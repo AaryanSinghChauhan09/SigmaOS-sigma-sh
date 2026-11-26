@@ -580,6 +580,12 @@ where
                 args.remove(i);
             }
         }
+        // Trailing `&` requests background execution. `launch` already
+        // runs children concurrently; other builtins are synchronous
+        // and complete before the next prompt regardless.
+        if args.last().is_some_and(|a| a == "&") {
+            args.pop();
+        }
         let prev_redir = self.redirect.take();
         if let Some(r) = redir {
             self.redirect = Some(r);
@@ -680,7 +686,7 @@ where
             "  mem             memory usage",
             "  ps              process list",
             "  time            uptime seconds",
-            "  launch <prog>   run a program",
+            "  launch <prog>   run a program (& = background, the default)",
             "  wait [pid]      wait for a child to exit",
             "  jobs            list background jobs",
             "  fg <job>        bring job to foreground",
@@ -1794,6 +1800,16 @@ mod tests {
         assert!(!o.contains("nope"));
         assert!(o.contains("fallback"));
         assert!(o.contains("colon-ok"));
+    }
+
+    #[test]
+    fn trailing_ampersand_is_accepted() {
+        let (mut sh, out) = shell(&["echo hi &", "launch /bin/sh &", "exit"]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("hi"));
+        assert!(o.contains("launched /bin/sh"));
+        assert!(!o.contains("&"));
     }
 
     #[test]
