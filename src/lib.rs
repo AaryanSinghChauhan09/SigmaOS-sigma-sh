@@ -548,6 +548,9 @@ where
             "sort" => self.cmd_sort(&args),
             "uniq" => self.cmd_uniq(&args),
             "find" => self.cmd_find(&args),
+            "basename" => self.cmd_basename(&args),
+            "dirname" => self.cmd_dirname(&args),
+            "seq" => self.cmd_seq(&args),
             "mem" => self.cmd_mem(),
             "ps" => self.cmd_ps(),
             "time" | "uptime" => self.emit(&format_u64(self.sys.uptime())),
@@ -590,6 +593,9 @@ where
             "  sort [-r] <file>    sort lines",
             "  uniq <file>         collapse adjacent duplicate lines",
             "  find [dir]          list files recursively",
+            "  basename <path> [suf]  last path component",
+            "  dirname <path>      parent directory",
+            "  seq [a [b]] <end>   print number sequence",
             "  true/:/false    no-op / fail (for && and ||)",
             "  clear           clear the screen",
             "  mem             memory usage",
@@ -1011,6 +1017,58 @@ where
         }
     }
 
+    fn cmd_basename(&mut self, args: &[String]) {
+        let Some(p) = args.first() else {
+            self.emit("basename: missing operand");
+            return;
+        };
+        let mut name = p.rsplit('/').next().unwrap_or(p.as_str());
+        if let Some(suf) = args.get(1) {
+            if let Some(stripped) = name.strip_suffix(suf.as_str()) {
+                if !stripped.is_empty() {
+                    name = stripped;
+                }
+            }
+        }
+        self.emit(name);
+    }
+
+    fn cmd_dirname(&mut self, args: &[String]) {
+        let Some(p) = args.first() else {
+            self.emit("dirname: missing operand");
+            return;
+        };
+        let trimmed = p.trim_end_matches('/');
+        let dir = match trimmed.rfind('/') {
+            Some(0) | None => "/",
+            Some(i) => &trimmed[..i],
+        };
+        self.emit(if dir.is_empty() { "/" } else { dir });
+    }
+
+    /// `seq [FIRST [INCREMENT]] LAST` — integer sequence.
+    fn cmd_seq(&mut self, args: &[String]) {
+        let nums: Vec<i64> = args.iter().filter_map(|a| a.parse().ok()).collect();
+        let (first, step, last) = match nums.len() {
+            1 => (1, 1, nums[0]),
+            2 => (nums[0], 1, nums[1]),
+            n if n >= 3 => (nums[0], nums[1], nums[2]),
+            _ => {
+                self.emit("seq: usage: seq [first [incr]] last");
+                return;
+            }
+        };
+        if step == 0 {
+            self.emit("seq: zero increment");
+            return;
+        }
+        let mut v = first;
+        while (step > 0 && v <= last) || (step < 0 && v >= last) {
+            self.emit(&v.to_string());
+            v += step;
+        }
+    }
+
     fn cmd_unset(&mut self, args: &[String]) {
         for a in args {
             self.env.retain(|(k, _)| k != a);
@@ -1137,6 +1195,9 @@ fn is_builtin(name: &str) -> bool {
             | "sort"
             | "uniq"
             | "find"
+            | "basename"
+            | "dirname"
+            | "seq"
             | "mem"
             | "ps"
             | "time"
@@ -1493,6 +1554,25 @@ mod tests {
         assert!(o.contains("b\na\nc\n"), "uniq output wrong: {}", o);
         assert!(o.contains("/bin/sh"));
         assert!(o.contains("/bin/init"));
+    }
+
+    #[test]
+    fn path_and_seq_utils() {
+        let (mut sh, out) = shell(&[
+            "basename /etc/hostname",
+            "basename /boot/vmlinuz-linux.img .img",
+            "dirname /etc/hostname",
+            "seq 3",
+            "seq 1 2 5",
+            "exit",
+        ]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("hostname"));
+        assert!(o.contains("vmlinuz-linux"));
+        assert!(o.contains("/etc"));
+        assert!(o.contains("1\n2\n3"));
+        assert!(o.contains("1\n3\n5"));
     }
 
     #[test]
