@@ -572,6 +572,28 @@ where
         // `>`/`>>` redirection: last occurrence wins, target resolved vs cwd.
         let mut args = cmd.args.clone();
         let mut redir = None;
+        let mut err_redir = None;
+        // `&>`/`&>>` redirects both streams; parsed first so a later
+        // explicit `>` or `2>` can still override its own stream.
+        if let Some(i) = args.iter().position(|a| a.starts_with("&>")) {
+            let tok = args[i].clone();
+            let (inline, append) = if tok == "&>" || tok == "&>>" {
+                (None, tok == "&>>")
+            } else if let Some(rest) = tok.strip_prefix("&>>") {
+                (Some(rest.to_string()), true)
+            } else {
+                (tok.strip_prefix("&>").map(str::to_string), false)
+            };
+            let has_inline = inline.is_some();
+            if let Some(target) = inline.or_else(|| args.get(i + 1).cloned()) {
+                let resolved = self.resolve(Some(&target));
+                redir = Some((resolved.clone(), append));
+                err_redir = Some((resolved, append));
+                args.drain(i..=i + usize::from(!has_inline));
+            } else {
+                args.remove(i);
+            }
+        }
         if let Some(i) = args.iter().position(|a| a == ">" || a == ">>") {
             let append = args[i] == ">>";
             if i + 1 < args.len() {
@@ -582,7 +604,6 @@ where
             }
         }
         // `2>`/`2>>` stderr redirection (launch only; same fd mechanism).
-        let mut err_redir = None;
         if let Some(i) = args
             .iter()
             .position(|a| a == "2>" || a == "2>>" || a.starts_with("2>") && a.len() > 2)
@@ -706,14 +727,23 @@ where
                     // prev_redir is restored at the end of this fn.
                     self.redirect = None;
                 }
-                // `2> file`: open the stderr target the same way.
+                // `2> file`: open the stderr target the same way. When it
+                // matches the stdout target (`&>`), share the fd so both
+                // streams keep one file offset.
                 if let Some((path, append)) = &err_redir {
-                    match self.fs.open_write(path, *append) {
-                        Some(fd) => stderr_fd = fd,
-                        None => {
-                            self.emit(&format!("launch: {}: cannot open for write", path));
-                            self.last_ok = false;
-                            return;
+                    if redir
+                        .as_ref()
+                        .is_some_and(|(p, a)| p == path && *a == *append)
+                    {
+                        stderr_fd = fd;
+                    } else {
+                        match self.fs.open_write(path, *append) {
+                            Some(fd) => stderr_fd = fd,
+                            None => {
+                                self.emit(&format!("launch: {}: cannot open for write", path));
+                                self.last_ok = false;
+                                return;
+                            }
                         }
                     }
                 }
@@ -772,6 +802,7 @@ where
             "  ps              process list",
             "  time            uptime seconds",
             "  launch <prog>   run a program (& = background, the default)",
+            "  redirects       > >> 2> 2>> &> &>>  and  < file  (real fds for launch)",
             "  wait [pid]      wait for a child to exit",
             "  jobs            list background jobs",
             "  fg <job>        bring job to foreground",
@@ -1630,8 +1661,20 @@ mod tests {
         writes: Rc<RefCell<Vec<(String, String, bool)>>>,
         dirs: Rc<RefCell<Vec<String>>>,
         removed: Rc<RefCell<Vec<String>>>,
+        open_log: Rc<RefCell<Vec<(String, bool)>>>,
     }
     impl Fs for TestFs {
+        fn open_write(&self, path: &str, append: bool) -> Option<i64> {
+            self.open_log.borrow_mut().push((path.to_string(), append));
+            Some(100 + self.open_log.borrow().len() as i64)
+        }
+        fn open_read(&self, path: &str) -> Option<i64> {
+            if self.read_to_string(path).is_some() {
+                Some(50)
+            } else {
+                None
+            }
+        }
         fn list(&self, path: &str) -> Option<Vec<String>> {
             match path {
                 "/" => Some(vec!["bin".to_string(), "etc".to_string()]),
@@ -1683,6 +1726,7 @@ mod tests {
     struct TestSys {
         launched: Rc<RefCell<Vec<String>>>,
         killed: Rc<RefCell<Vec<(i64, String)>>>,
+        fds: Rc<RefCell<Vec<(i64, i64, i64)>>>,
     }
     impl System for TestSys {
         fn reboot(&self) {}
@@ -1691,11 +1735,12 @@ mod tests {
             path: &str,
             _args: &[String],
             _env: &[String],
-            _stdout_fd: i64,
-            _stdin_fd: i64,
-            _stderr_fd: i64,
+            stdout_fd: i64,
+            stdin_fd: i64,
+            stderr_fd: i64,
         ) -> Result<i64, String> {
             self.launched.borrow_mut().push(path.to_string());
+            self.fds.borrow_mut().push((stdout_fd, stdin_fd, stderr_fd));
             Ok(100)
         }
         fn uptime(&self) -> u64 {
@@ -1720,6 +1765,7 @@ mod tests {
         let out = Rc::new(RefCell::new(String::new()));
         let launched = Rc::new(RefCell::new(Vec::new()));
         let killed = Rc::new(RefCell::new(Vec::new()));
+        let fds = Rc::new(RefCell::new(Vec::new()));
         let sh = Shell::new(
             TestIo {
                 input: lines.iter().map(|s| s.to_string()).collect(),
@@ -1728,7 +1774,11 @@ mod tests {
             TestFs::default(),
             TestProcs,
             TestMem,
-            TestSys { launched, killed },
+            TestSys {
+                launched,
+                killed,
+                fds,
+            },
         );
         (sh, out)
     }
@@ -1933,6 +1983,37 @@ mod tests {
         assert!(writes.contains(&("/tmp/out".to_string(), "hello\n".to_string(), false)));
         assert!(writes.contains(&("/tmp/out".to_string(), "world\n".to_string(), true)));
         assert!(writes.contains(&("/tmp/pwd".to_string(), "/\n".to_string(), false)));
+    }
+
+    #[test]
+    fn amp_redirect_builtin() {
+        let (mut sh, out) = shell(&["echo hi &> /tmp/both", "echo yo &>> /tmp/both", "exit"]);
+        sh.run();
+        assert!(!out.borrow().contains("hi"));
+        let writes = sh.fs.writes.borrow();
+        assert!(writes.contains(&("/tmp/both".to_string(), "hi\n".to_string(), false)));
+        assert!(writes.contains(&("/tmp/both".to_string(), "yo\n".to_string(), true)));
+    }
+
+    #[test]
+    fn amp_redirect_launch_shares_fd() {
+        let (mut sh, _out) = shell(&[
+            "launch /bin/sh &> /tmp/both",
+            "launch /bin/sh 2> /tmp/err",
+            "exit",
+        ]);
+        sh.run();
+        // `&>` opens the target once and hands the same fd to both
+        // stdout_fd and stderr_fd; `2>` alone leaves stdout on console.
+        assert_eq!(
+            sh.fs.open_log.borrow().as_slice(),
+            &[
+                ("/tmp/both".to_string(), false),
+                ("/tmp/err".to_string(), false),
+            ]
+        );
+        let fds = sh.sys.fds.borrow();
+        assert_eq!(fds.as_slice(), &[(101, 0, 101), (0, 0, 102)]);
     }
 
     #[test]
