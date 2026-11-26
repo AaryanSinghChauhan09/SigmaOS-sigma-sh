@@ -133,12 +133,6 @@ impl System for StdSys {
 
 fn main() {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-    let mut shell = Shell::new(
-        StdIo,
-        StdFs { cwd },
-        StdProcs,
-        StdMem,
-        StdSys,
-    );
+    let mut shell = Shell::new(StdIo, StdFs { cwd }, StdProcs, StdMem, StdSys);
     shell.run();
 }

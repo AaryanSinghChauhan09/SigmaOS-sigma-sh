@@ -8,13 +8,13 @@
 extern crate alloc;
 extern crate sigma_sys;
 
-use sigma_sys::{open, read, close, print};
+use sigma_sys::{close, open, print, read};
 
 #[no_mangle]
 pub extern "C" fn main() -> i32 {
     let args = ["cat", "/"];
     let path = if args.len() > 1 { args[1] } else { "/" };
-    
+
     match open(path, 0) {
         Ok(fd) => {
             let mut buf = [0u8; 4096];

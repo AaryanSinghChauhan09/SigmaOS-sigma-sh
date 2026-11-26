@@ -115,11 +115,8 @@ pub fn parse(line: &str) -> Option<Command> {
 
 /// Parse a pipeline (commands separated by |).
 pub fn parse_pipeline(line: &str) -> Option<Pipeline> {
-    let commands: Vec<Command> = line
-        .split('|')
-        .filter_map(parse)
-        .collect();
-    
+    let commands: Vec<Command> = line.split('|').filter_map(parse).collect();
+
     if commands.is_empty() {
         None
     } else {
@@ -181,7 +178,7 @@ where
             self.execute_pipeline(&pipeline);
             return;
         }
-        
+
         // Fall back to single command
         let Some(cmd) = parse(line) else {
             return;
@@ -201,7 +198,9 @@ where
             "jobs" => self.cmd_jobs(),
             "fg" => self.cmd_fg(&cmd.args),
             "bg" => self.cmd_bg(&cmd.args),
-            _ => self.io.writeln(&format!("sigma-sh: {}: command not found", cmd.name)),
+            _ => self
+                .io
+                .writeln(&format!("sigma-sh: {}: command not found", cmd.name)),
         }
     }
 
@@ -214,7 +213,8 @@ where
         // - Waiting for all processes in pipeline
         // For now, this is a stub that executes commands sequentially
         for cmd in &pipeline.commands {
-            self.io.writeln(&format!("sigma-sh: pipeline: executing {}", cmd.name));
+            self.io
+                .writeln(&format!("sigma-sh: pipeline: executing {}", cmd.name));
             // Execute each command in sequence (no real piping yet)
             self.execute_single_command(cmd);
         }
@@ -237,7 +237,9 @@ where
             "jobs" => self.cmd_jobs(),
             "fg" => self.cmd_fg(&cmd.args),
             "bg" => self.cmd_bg(&cmd.args),
-            _ => self.io.writeln(&format!("sigma-sh: {}: command not found", cmd.name)),
+            _ => self
+                .io
+                .writeln(&format!("sigma-sh: {}: command not found", cmd.name)),
         }
     }
 
@@ -306,10 +308,8 @@ where
 
     fn cmd_mem(&mut self) {
         let (total, free) = self.mem.memory_kb();
-        self.io.writeln(&format!(
-            "mem: {} KiB total, {} KiB free",
-            total, free
-        ));
+        self.io
+            .writeln(&format!("mem: {} KiB total, {} KiB free", total, free));
     }
 
     fn cmd_ps(&mut self) {
@@ -331,7 +331,8 @@ where
 
     /// Job control: list background jobs (stub for now)
     fn cmd_jobs(&mut self) {
-        self.io.writeln("jobs: no background jobs (job control not implemented)");
+        self.io
+            .writeln("jobs: no background jobs (job control not implemented)");
     }
 
     /// Job control: bring job to foreground (stub for now)
@@ -424,7 +425,12 @@ mod tests {
     }
 
     #[allow(clippy::type_complexity)]
-    fn shell(lines: &[&str]) -> (Shell<TestIo, TestFs, TestProcs, TestMem, TestSys>, Rc<RefCell<String>>) {
+    fn shell(
+        lines: &[&str],
+    ) -> (
+        Shell<TestIo, TestFs, TestProcs, TestMem, TestSys>,
+        Rc<RefCell<String>>,
+    ) {
         let out = Rc::new(RefCell::new(String::new()));
         let launched = Rc::new(RefCell::new(Vec::new()));
         let sh = Shell::new(

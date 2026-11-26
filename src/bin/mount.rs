@@ -47,13 +47,13 @@ fn cmd_mount(device: &str, mountpoint: &str, fstype: Option<&str>, _opts: Option
     let _ = print(" at ");
     let _ = print(mountpoint);
     let _ = print("\n");
-    
+
     if let Some(fs) = fstype {
         let _ = print("  type: ");
         let _ = print(fs);
         let _ = print("\n");
     }
-    
+
     let _ = print("Note: Full mount support requires kernel mount syscall\n");
 }
 

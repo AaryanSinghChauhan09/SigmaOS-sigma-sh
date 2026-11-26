@@ -15,7 +15,7 @@ use sigma_sys::{listdir, print};
 pub extern "C" fn main() -> i32 {
     let args = ["ls", "/"];
     let path = if args.len() > 1 { args[1] } else { "/" };
-    
+
     let mut buf = [0u8; 4096];
     match listdir(path, &mut buf) {
         Ok(n) => {

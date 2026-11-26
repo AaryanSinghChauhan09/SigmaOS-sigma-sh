@@ -5,8 +5,8 @@
 #![no_main]
 #![allow(static_mut_refs)]
 
-use sigma_sys as sys;
 use core::alloc::{GlobalAlloc, Layout};
+use sigma_sys as sys;
 
 struct Bump;
 static mut HEAP: [u8; 16 * 1024] = [0; 16 * 1024];

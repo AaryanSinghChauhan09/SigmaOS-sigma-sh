@@ -9,7 +9,6 @@
 #![no_main]
 #![allow(static_mut_refs)]
 
-
 use sigma_sys as sys;
 
 /// Print a u64 in decimal — stack buffer only, no allocator.
@@ -264,7 +263,11 @@ fn run(cmd: &str) {
                 return;
             };
             let pid = ps.bytes().fold(0u64, |a, b| {
-                if b.is_ascii_digit() { a * 10 + (b - b'0') as u64 } else { a }
+                if b.is_ascii_digit() {
+                    a * 10 + (b - b'0') as u64
+                } else {
+                    a
+                }
             });
             match sys::api::wait(pid) {
                 Ok(code) => {
@@ -275,32 +278,28 @@ fn run(cmd: &str) {
                 Err(e) => perr(e),
             }
         }
-        Some("ver") => {
-            match sys::api::kernel_version() {
-                Ok(v) => {
-                    let _ = sys::api::print("kernel ");
-                    let _ = sys::api::print(&v);
-                    let _ = sys::api::print("\n");
-                }
-                Err(e) => {
-                    let _ = sys::api::print("ver err ");
-                    perr(e);
-                }
+        Some("ver") => match sys::api::kernel_version() {
+            Ok(v) => {
+                let _ = sys::api::print("kernel ");
+                let _ = sys::api::print(&v);
+                let _ = sys::api::print("\n");
             }
-        }
-        Some("time") => {
-            match sys::api::time() {
-                Ok(t) => {
-                    let _ = sys::api::print("ticks=");
-                    pdec(t);
-                    let _ = sys::api::print("\n");
-                }
-                Err(e) => {
-                    let _ = sys::api::print("time err ");
-                    perr(e);
-                }
+            Err(e) => {
+                let _ = sys::api::print("ver err ");
+                perr(e);
             }
-        }
+        },
+        Some("time") => match sys::api::time() {
+            Ok(t) => {
+                let _ = sys::api::print("ticks=");
+                pdec(t);
+                let _ = sys::api::print("\n");
+            }
+            Err(e) => {
+                let _ = sys::api::print("time err ");
+                perr(e);
+            }
+        },
         Some("exit") => {
             let _ = sys::api::print("sigma-init: bye\n");
             sys::api::exit(0);

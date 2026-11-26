@@ -27,7 +27,10 @@ fn parse_args(args: &[&str]) -> PkgCommand {
     }
     let name = String::from(args[0]);
     let cmd_args: alloc::vec::Vec<String> = args[1..].iter().map(|s| String::from(*s)).collect();
-    PkgCommand { name, args: cmd_args }
+    PkgCommand {
+        name,
+        args: cmd_args,
+    }
 }
 
 fn cmd_help() {
