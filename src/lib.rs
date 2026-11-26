@@ -1,6 +1,6 @@
 //! SigmaOS sigma-sh — minimal rescue shell.
 //!
-//! Builtins: help, ls, pwd, echo, cat, which, mem, ps, time, launch, reboot,
+//! Builtins: help, ls, pwd, cd, echo, cat, which, mem, ps, time, launch, reboot,
 //! exit. I/O and filesystem access go through traits so the shell is
 //! fully testable on host and pluggable to sigma-sys at runtime.
 
@@ -188,6 +188,7 @@ where
             "exit" | "logout" | "quit" => self.running = false,
             "echo" => self.io.writeln(&cmd.args.join(" ")),
             "pwd" => self.io.writeln(&self.cwd),
+            "cd" => self.cmd_cd(&cmd.args),
             "ls" => self.cmd_ls(&cmd.args),
             "cat" => self.cmd_cat(&cmd.args),
             "which" => self.cmd_which(&cmd.args),
@@ -228,6 +229,7 @@ where
             "exit" | "logout" | "quit" => self.running = false,
             "echo" => self.io.writeln(&cmd.args.join(" ")),
             "pwd" => self.io.writeln(&self.cwd),
+            "cd" => self.cmd_cd(&cmd.args),
             "ls" => self.cmd_ls(&cmd.args),
             "cat" => self.cmd_cat(&cmd.args),
             "which" => self.cmd_which(&cmd.args),
@@ -251,6 +253,7 @@ where
             "  help            show this text",
             "  ls [dir]        list directory",
             "  pwd             print working directory",
+            "  cd [dir]        change directory",
             "  echo <text>     print text",
             "  cat <file>      print file",
             "  which <prog>    locate a program on PATH",
@@ -282,6 +285,38 @@ where
             format!("/{}", a)
         } else {
             format!("{}/{}", self.cwd, a)
+        }
+    }
+
+    fn cmd_cd(&mut self, args: &[String]) {
+        let target = match args.first() {
+            None => "/".to_string(),
+            Some(a) if a == "~" => "/".to_string(),
+            Some(a) => self.resolve(Some(a)),
+        };
+        // Normalize "." and ".." segments.
+        let mut parts: Vec<&str> = Vec::new();
+        for seg in target.split('/') {
+            match seg {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                s => parts.push(s),
+            }
+        }
+        let norm = if parts.is_empty() {
+            "/".to_string()
+        } else {
+            let mut p = String::from("/");
+            p.push_str(&parts.join("/"));
+            p
+        };
+        match self.fs.list(&norm) {
+            Some(_) => self.cwd = norm,
+            None => self
+                .io
+                .writeln(&format!("cd: {}: no such directory", target)),
         }
     }
 
@@ -550,6 +585,16 @@ mod tests {
         assert!(o.contains("/bin/sh"));
         assert!(o.contains("which: no missing in PATH"));
         assert!(o.contains("which: no /nope in /nope"));
+    }
+
+    #[test]
+    fn cd_changes_directory() {
+        let (mut sh, out) = shell(&["cd /bin", "pwd", "cd ..", "pwd", "cd /nope", "pwd", "exit"]);
+        sh.run();
+        let o = out.borrow();
+        // cd /bin then pwd -> /bin appears; cd .. returns to /; cd /nope fails.
+        assert!(o.contains("/bin"));
+        assert!(o.contains("cd: /nope: no such directory"));
     }
 
     #[test]
