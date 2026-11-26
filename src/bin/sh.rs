@@ -181,6 +181,28 @@ impl Fs for SysFs {
             Err(_) => "/".to_string(),
         }
     }
+
+    fn pipe(&self) -> Option<(i64, i64)> {
+        sys::api::pipe().ok()
+    }
+
+    fn close(&self, fd: i64) -> bool {
+        sys::api::close(fd).is_ok()
+    }
+
+    fn read_fd(&self, fd: i64, buf: &mut [u8]) -> i64 {
+        match sys::api::read(fd, buf) {
+            Ok(n) => n as i64,
+            Err(e) => e,
+        }
+    }
+
+    fn write_fd(&self, fd: i64, buf: &[u8]) -> i64 {
+        match sys::api::write(fd, buf) {
+            Ok(n) => n as i64,
+            Err(e) => e,
+        }
+    }
 }
 
 // ── Process table / memory: PROCINFO + MEMINFO syscalls ───────────────

@@ -69,6 +69,25 @@ pub trait Fs {
     fn chdir(&self, _path: &str) -> bool {
         false
     }
+    /// Create a pipe; returns (read_fd, write_fd). Default: unsupported.
+    fn pipe(&self) -> Option<(i64, i64)> {
+        None
+    }
+    /// Close an fd. Default: unsupported.
+    fn close(&self, _fd: i64) -> bool {
+        false
+    }
+    /// Read up to `buf.len()` bytes from `fd`; returns bytes read
+    /// (0 = EOF) or a negative errno (-11 = EAGAIN, retry). Default:
+    /// unsupported (-38).
+    fn read_fd(&self, _fd: i64, _buf: &mut [u8]) -> i64 {
+        -38
+    }
+    /// Write bytes to `fd`; returns bytes written or a negative errno.
+    /// Default: unsupported (-38).
+    fn write_fd(&self, _fd: i64, _buf: &[u8]) -> i64 {
+        -38
+    }
     /// Current directory.
     fn cwd(&self) -> String;
 }
@@ -316,6 +335,10 @@ pub struct Shell<I, F, P, M, S> {
     pub last_pid: Option<i64>,
     /// Launched jobs: (pid, command line, reaped flag).
     pub jobs: Vec<(i64, String, bool)>,
+    /// Pipe fd to use as the next launch stage's stdin (0 = none).
+    pub pipe_in_fd: i64,
+    /// Pipe fd to use as the next launch stage's stdout (0 = none).
+    pub pipe_out_fd: i64,
     pub running: bool,
 }
 
@@ -346,6 +369,8 @@ where
             pending_stdin: None,
             last_pid: None,
             jobs: Vec::new(),
+            pipe_in_fd: 0,
+            pipe_out_fd: 0,
             running: true,
         }
     }
@@ -427,24 +452,165 @@ where
         self.execute_single_command(&cmd);
     }
 
-    /// Execute a pipeline of commands, wiring each stage's stdout into the
-    /// next stage's stdin via `capture`/`pending_stdin`.
+    /// Execute a pipeline of commands. Builtin-to-builtin stages keep
+    /// the text-capture path; stages involving `launch`/`run` are wired
+    /// with real kernel pipes (fd-to-fd, fully concurrent).
     pub fn execute_pipeline(&mut self, pipeline: &Pipeline) {
-        let last = pipeline.commands.len().saturating_sub(1);
-        for (i, cmd) in pipeline.commands.iter().enumerate() {
+        let cmds: Vec<Command> = pipeline
+            .commands
+            .iter()
+            .map(|c| self.expand_command(c.clone()))
+            .collect();
+        let n = cmds.len();
+        if n == 0 {
+            return;
+        }
+        // A launch stage can take a pipe on stdout unless it has its
+        // own `>`/`>>`/`&>` redirect; `<` on stdin always wins over a
+        // pipeline feed.
+        let is_launch = |c: &Command| c.name == "launch" || c.name == "run";
+        let has_out_redir = |c: &Command| {
+            c.args
+                .iter()
+                .any(|a| a == ">" || a == ">>" || a.starts_with("&>"))
+        };
+        let has_in_redir = |c: &Command| c.args.iter().any(|a| a == "<");
+
+        let mut drain_fd: Option<i64> = None; // pipe read end to drain/feed next stage
+        let mut starved = false; // previous stage produced no consumable output
+        let mut deferred: Vec<(i64, String)> = Vec::new(); // (pipe w, text) to write post-spawn
+        let mut shell_fds: Vec<i64> = Vec::new(); // shell copies to close at end
+
+        for (i, cmd) in cmds.iter().enumerate() {
             if !self.running {
                 break;
             }
-            let expanded = self.expand_command(cmd.clone());
-            if i == last {
-                self.execute_single_command(&expanded);
-            } else {
+            let last = i + 1 == n;
+            let launch = is_launch(cmd);
+
+            // ── stage input ──────────────────────────────────────
+            let mut in_fd = 0i64;
+            if launch {
+                if !has_in_redir(cmd) {
+                    if let Some(r) = drain_fd.take() {
+                        // Previous pipeable launch: hand the read end
+                        // straight to this child.
+                        in_fd = r;
+                        shell_fds.push(r);
+                    } else if starved {
+                        // Previous stage wrote to a file/nowhere: feed
+                        // this child instant EOF via a closed pipe.
+                        if let Some((r, w)) = self.fs.pipe() {
+                            let _ = self.fs.close(w);
+                            in_fd = r;
+                            shell_fds.push(r);
+                        }
+                    } else if let Some(text) = self.pending_stdin.take() {
+                        // Previous builtin produced text: feed it to
+                        // the child through a fresh pipe, written
+                        // after the spawn below.
+                        if let Some((r, w)) = self.fs.pipe() {
+                            in_fd = r;
+                            deferred.push((w, text));
+                            shell_fds.push(r);
+                            shell_fds.push(w);
+                        }
+                    }
+                }
+            } else if let Some(r) = drain_fd.take() {
+                // Builtin consumes a pipe: drain it to text (blocks
+                // until the producer's write end closes = EOF).
+                let text = self.drain_pipe(r);
+                shell_fds.push(r);
+                self.pending_stdin = Some(text);
+            } else if starved {
+                self.pending_stdin = Some(String::new());
+            }
+
+            // ── stage output ─────────────────────────────────────
+            let mut out_fd = 0i64;
+            let mut produced_r: Option<i64> = None;
+            if !last && launch && !has_out_redir(cmd) {
+                if let Some((r, w)) = self.fs.pipe() {
+                    out_fd = w;
+                    produced_r = Some(r);
+                    shell_fds.push(w); // shell's copy; child has its own
+                }
+            }
+            // Builtins capture text for the next stage; launch status
+            // messages always go to the console.
+            if !last && !launch {
                 self.capture = Some(String::new());
-                self.execute_single_command(&expanded);
-                self.pending_stdin = Some(self.capture.take().unwrap_or_default());
+            }
+            self.pipe_in_fd = in_fd;
+            self.pipe_out_fd = out_fd;
+            self.execute_single_command(cmd);
+            self.pipe_in_fd = 0;
+            self.pipe_out_fd = 0;
+
+            // Feed deferred pipe text now that the child exists.
+            for (w, text) in deferred.drain(..) {
+                self.feed_pipe(w, &text);
+                let _ = self.fs.close(w);
+            }
+
+            // ── stage result → next input ────────────────────────
+            if !last {
+                if let Some(r) = produced_r {
+                    drain_fd = Some(r); // next launch uses it as in_fd, next builtin drains it
+                    starved = false;
+                } else if launch {
+                    // launch with `>` or no pipe support: nothing
+                    // consumable downstream.
+                    starved = true;
+                    self.pending_stdin = None;
+                } else {
+                    // builtin text output feeds the next stage.
+                    self.pending_stdin = Some(self.capture.take().unwrap_or_default());
+                    starved = false;
+                }
             }
         }
         self.pending_stdin = None;
+        self.capture = None;
+        for fd in shell_fds {
+            let _ = self.fs.close(fd);
+        }
+    }
+
+    /// Read a pipe fd to EOF, returning its contents. Blocks via the
+    /// kernel's pipe sleep/wake; -11 wakes are retried.
+    fn drain_pipe(&self, fd: i64) -> String {
+        let mut out = String::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            match self.fs.read_fd(fd, &mut buf) {
+                0 => break, // EOF
+                n if n > 0 => {
+                    out.push_str(&String::from_utf8_lossy(&buf[..n as usize]));
+                    if out.len() > 1 << 20 {
+                        break;
+                    }
+                }
+                -11 => continue, // EAGAIN wake: retry
+                _ => break,      // real error
+            }
+        }
+        out
+    }
+
+    /// Write `text` into a pipe fd, looping over partial writes.
+    /// Stops early on error (e.g. EPIPE if the child already exited).
+    fn feed_pipe(&self, fd: i64, text: &str) {
+        let bytes = text.as_bytes();
+        let mut off = 0usize;
+        while off < bytes.len() {
+            match self.fs.write_fd(fd, &bytes[off..]) {
+                n if n > 0 => off += n as usize,
+                -11 => continue, // EAGAIN wake: retry
+                _ => break,      // EOF/error/EPIPE
+            }
+        }
     }
 
     /// Text piped into the current command's stdin, consumed once.
@@ -655,6 +821,11 @@ where
                 args.remove(i);
             }
         }
+        // Pipeline stdin: an explicit `<` wins; otherwise a pipe read
+        // fd supplied by execute_pipeline feeds the child's fd 0.
+        if stdin_fd == 0 && self.pipe_in_fd > 0 {
+            stdin_fd = self.pipe_in_fd;
+        }
         // Trailing `&` requests background execution. `launch` already
         // runs children concurrently; other builtins are synchronous
         // and complete before the next prompt regardless.
@@ -720,11 +891,12 @@ where
                             return;
                         }
                     },
-                    None => 0,
+                    None => self.pipe_out_fd,
                 };
-                if redir.is_some() {
-                    // fd redirect replaces the emit redirect for launch;
-                    // prev_redir is restored at the end of this fn.
+                if redir.is_some() || self.pipe_out_fd > 0 {
+                    // fd redirect (file or pipe) replaces the emit
+                    // redirect for launch; prev_redir is restored at
+                    // the end of this fn.
                     self.redirect = None;
                 }
                 // `2> file`: open the stderr target the same way. When it
@@ -1662,8 +1834,58 @@ mod tests {
         dirs: Rc<RefCell<Vec<String>>>,
         removed: Rc<RefCell<Vec<String>>>,
         open_log: Rc<RefCell<Vec<(String, bool)>>>,
+        // In-memory pipe model: fd -> (pipe_id, is_write); buffers per pipe.
+        pipe_fds: Rc<RefCell<std::collections::BTreeMap<i64, (usize, bool)>>>,
+        pipe_bufs: Rc<RefCell<std::collections::BTreeMap<usize, std::collections::VecDeque<u8>>>>,
+        pipe_next: Rc<RefCell<usize>>,
+        closed: Rc<RefCell<Vec<i64>>>,
     }
     impl Fs for TestFs {
+        fn pipe(&self) -> Option<(i64, i64)> {
+            let mut next = self.pipe_next.borrow_mut();
+            let id = *next;
+            *next += 1;
+            drop(next);
+            let r = 300 + id as i64 * 2;
+            let w = r + 1;
+            self.pipe_fds.borrow_mut().insert(r, (id, false));
+            self.pipe_fds.borrow_mut().insert(w, (id, true));
+            self.pipe_bufs.borrow_mut().insert(id, Default::default());
+            Some((r, w))
+        }
+        fn close(&self, fd: i64) -> bool {
+            self.closed.borrow_mut().push(fd);
+            self.pipe_fds.borrow_mut().remove(&fd).is_some()
+        }
+        fn read_fd(&self, fd: i64, buf: &mut [u8]) -> i64 {
+            let Some(&(id, is_write)) = self.pipe_fds.borrow().get(&fd) else {
+                return -9;
+            };
+            if is_write {
+                return -9;
+            }
+            let mut bufs = self.pipe_bufs.borrow_mut();
+            let q = bufs.entry(id).or_default();
+            let n = q.len().min(buf.len());
+            for b in buf.iter_mut().take(n) {
+                *b = q.pop_front().unwrap();
+            }
+            n as i64 // empty pipe reads as EOF in tests (no real blocking)
+        }
+        fn write_fd(&self, fd: i64, buf: &[u8]) -> i64 {
+            let Some(&(id, is_write)) = self.pipe_fds.borrow().get(&fd) else {
+                return -9;
+            };
+            if !is_write {
+                return -9;
+            }
+            let mut bufs = self.pipe_bufs.borrow_mut();
+            let q = bufs.entry(id).or_default();
+            for &b in buf {
+                q.push_back(b);
+            }
+            buf.len() as i64
+        }
         fn open_write(&self, path: &str, append: bool) -> Option<i64> {
             self.open_log.borrow_mut().push((path.to_string(), append));
             Some(100 + self.open_log.borrow().len() as i64)
@@ -2014,6 +2236,32 @@ mod tests {
         );
         let fds = sh.sys.fds.borrow();
         assert_eq!(fds.as_slice(), &[(101, 0, 101), (0, 0, 102)]);
+    }
+
+    #[test]
+    fn launch_pipe_pipeline_wires_fds() {
+        let (mut sh, _out) = shell(&["launch /a x | launch /b y", "exit"]);
+        sh.run();
+        // Stage 0 writes to pipe w (301); stage 1 reads pipe r (300).
+        let fds = sh.sys.fds.borrow();
+        assert_eq!(fds.as_slice(), &[(301, 0, 0), (0, 300, 0)]);
+        drop(fds);
+        // The shell closes its own copies of both pipe ends.
+        let closed = sh.fs.closed.borrow();
+        assert!(closed.contains(&300) && closed.contains(&301));
+    }
+
+    #[test]
+    fn builtin_to_launch_pipes_text() {
+        let (mut sh, _out) = shell(&["echo hello | launch /b", "exit"]);
+        sh.run();
+        let fds = sh.sys.fds.borrow();
+        assert_eq!(fds.as_slice(), &[(0, 300, 0)]);
+        drop(fds);
+        // The builtin's captured output was written into the pipe.
+        let bufs = sh.fs.pipe_bufs.borrow();
+        let data: Vec<u8> = bufs.values().next().unwrap().iter().copied().collect();
+        assert_eq!(data, b"hello\n");
     }
 
     #[test]

@@ -108,6 +108,43 @@ fn main_inner(argc: u64, argv: *const *const u8) -> ! {
         }
     }
     let _ = sys::api::print("\n");
+    // `pipe` arg: echo stdin to stdout until EOF — exercises kernel
+    // pipes end-to-end (`launch /child pipe | launch /child pipe`).
+    let mut wants_pipe = false;
+    if !argv.is_null() {
+        for i in 0..argc as usize {
+            let p = unsafe { *argv.add(i) };
+            if p.is_null() {
+                continue;
+            }
+            let mut s = alloc::string::String::new();
+            unsafe {
+                let mut q = p;
+                while *q != 0 && s.len() < 64 {
+                    s.push(*q as char);
+                    q = q.add(1);
+                }
+            }
+            if s == "pipe" {
+                wants_pipe = true;
+            }
+        }
+    }
+    if wants_pipe {
+        let mut buf = [0u8; 512];
+        loop {
+            match sys::api::read(0, &mut buf) {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    let _ = sys::api::write(1, &buf[..n]);
+                }
+                Err(-11) => continue, // EAGAIN wake: retry
+                Err(_) => break,
+            }
+        }
+        let _ = sys::api::print("sigma-child: pipe-eof\n");
+        sys::api::exit(42);
+    }
     // `stderr` arg writes a marker to fd 2 for 2> redirect tests.
     if !argv.is_null() {
         for i in 0..argc as usize {
