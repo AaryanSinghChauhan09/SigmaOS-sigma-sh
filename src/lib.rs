@@ -2,8 +2,8 @@
 //!
 //! Builtins: help, ls, pwd, cd, echo, cat, which, history, export, unset,
 //! mem, ps, time, launch, reboot, true/false/:/clear, mkdir/rmdir/rm/touch,
-//! `>`/`>>` redirection, plus `*` glob expansion in arguments.
-//! `launch` resolves bare names through PATH.
+//! `>`/`>>` redirection, `|` pipelines between builtins, plus `*` glob
+//! expansion in arguments. `launch` resolves bare names through PATH.
 //! exit. I/O and filesystem access go through traits so the shell is
 //! fully testable on host and pluggable to sigma-sys at runtime.
 
@@ -271,6 +271,11 @@ pub struct Shell<I, F, P, M, S> {
     pub redirect: Option<(String, bool)>,
     /// Whether the current `>` target has been created/truncated already.
     pub redirect_initialized: bool,
+    /// When set, `emit` output is captured here instead of going to io
+    /// (used to feed the next stage of a pipeline).
+    pub capture: Option<String>,
+    /// Text fed to the current command's stdin by the previous pipeline stage.
+    pub pending_stdin: Option<String>,
     pub running: bool,
 }
 
@@ -297,6 +302,8 @@ where
             last_ok: true,
             redirect: None,
             redirect_initialized: false,
+            capture: None,
+            pending_stdin: None,
             running: true,
         }
     }
@@ -378,20 +385,29 @@ where
         self.execute_single_command(&cmd);
     }
 
-    /// Execute a pipeline of commands.
+    /// Execute a pipeline of commands, wiring each stage's stdout into the
+    /// next stage's stdin via `capture`/`pending_stdin`.
     pub fn execute_pipeline(&mut self, pipeline: &Pipeline) {
-        // Note: Full pipeline implementation requires:
-        // - Process spawning with pipe creation
-        // - Pipe file descriptor management
-        // - Connecting stdout of one command to stdin of next
-        // - Waiting for all processes in pipeline
-        // For now, this is a stub that executes commands sequentially
-        for cmd in &pipeline.commands {
-            self.emit(&format!("sigma-sh: pipeline: executing {}", cmd.name));
-            // Execute each command in sequence (no real piping yet)
+        let last = pipeline.commands.len().saturating_sub(1);
+        for (i, cmd) in pipeline.commands.iter().enumerate() {
+            if !self.running {
+                break;
+            }
             let expanded = self.expand_command(cmd.clone());
-            self.execute_single_command(&expanded);
+            if i == last {
+                self.execute_single_command(&expanded);
+            } else {
+                self.capture = Some(String::new());
+                self.execute_single_command(&expanded);
+                self.pending_stdin = Some(self.capture.take().unwrap_or_default());
+            }
         }
+        self.pending_stdin = None;
+    }
+
+    /// Text piped into the current command's stdin, consumed once.
+    fn take_stdin(&mut self) -> String {
+        self.pending_stdin.take().unwrap_or_default()
     }
 
     /// Write raw output honoring an active `>`/`>>` redirect.
@@ -404,7 +420,13 @@ where
                     self.redirect_initialized = true;
                 }
             }
-            None => self.io.write(s),
+            None => {
+                if let Some(buf) = self.capture.as_mut() {
+                    buf.push_str(s);
+                } else {
+                    self.io.write(s);
+                }
+            }
         }
     }
 
@@ -687,7 +709,12 @@ where
 
     fn cmd_cat(&mut self, args: &[String]) {
         let Some(a) = args.first() else {
-            self.emit("cat: missing file");
+            if self.pending_stdin.is_some() {
+                let s = self.take_stdin();
+                self.emit_raw(&s);
+            } else {
+                self.emit("cat: missing file");
+            }
             return;
         };
         let path = self.resolve(Some(a));
@@ -881,14 +908,22 @@ where
                 i += 1;
             }
         }
-        let Some(f) = file else {
-            self.emit(&format!("{}: missing file", name));
-            return;
-        };
-        let path = self.resolve(Some(f));
-        let Some(data) = self.fs.read_to_string(&path) else {
-            self.emit(&format!("{}: {}: no such file", name, path));
-            return;
+        let data = match file {
+            Some(f) => {
+                let path = self.resolve(Some(f));
+                let Some(d) = self.fs.read_to_string(&path) else {
+                    self.emit(&format!("{}: {}: no such file", name, path));
+                    return;
+                };
+                d
+            }
+            None => {
+                if self.pending_stdin.is_none() {
+                    self.emit(&format!("{}: missing file", name));
+                    return;
+                }
+                self.take_stdin()
+            }
         };
         let lines: Vec<&str> = data.lines().collect();
         let selected: Vec<&str> = if head {
@@ -903,19 +938,33 @@ where
     }
 
     fn cmd_wc(&mut self, args: &[String]) {
-        let Some(f) = args.first() else {
-            self.emit("wc: missing file");
-            return;
-        };
-        let path = self.resolve(Some(f));
-        let Some(data) = self.fs.read_to_string(&path) else {
-            self.emit(&format!("wc: {}: no such file", path));
-            return;
+        let data = match args.first() {
+            Some(f) => {
+                let path = self.resolve(Some(f));
+                let Some(d) = self.fs.read_to_string(&path) else {
+                    self.emit(&format!("wc: {}: no such file", path));
+                    return;
+                };
+                d
+            }
+            None => {
+                if self.pending_stdin.is_none() {
+                    self.emit("wc: missing file");
+                    return;
+                }
+                self.take_stdin()
+            }
         };
         let lines = data.lines().count();
         let words = data.split_whitespace().count();
         let bytes = data.len();
-        self.emit(&format!("{} {} {} {}", lines, words, bytes, path));
+        match args.first() {
+            Some(f) => {
+                let path = self.resolve(Some(f));
+                self.emit(&format!("{} {} {} {}", lines, words, bytes, path));
+            }
+            None => self.emit(&format!("{} {} {}", lines, words, bytes)),
+        }
     }
 
     /// `grep [-ivnc] PATTERN FILE` — substring match per line.
@@ -934,8 +983,8 @@ where
                 _ => pos.push(a),
             }
         }
-        if pos.len() < 2 {
-            self.emit("grep: usage: grep [-ivnc] <pattern> <file>");
+        if pos.is_empty() || (pos.len() < 2 && self.pending_stdin.is_none()) {
+            self.emit("grep: usage: grep [-ivnc] <pattern> [file]");
             return;
         }
         let pat = if icase {
@@ -943,10 +992,16 @@ where
         } else {
             pos[0].clone()
         };
-        let path = self.resolve(Some(pos[1]));
-        let Some(data) = self.fs.read_to_string(&path) else {
-            self.emit(&format!("grep: {}: no such file", path));
-            return;
+        let data = match pos.get(1) {
+            Some(f) => {
+                let path = self.resolve(Some(f));
+                let Some(d) = self.fs.read_to_string(&path) else {
+                    self.emit(&format!("grep: {}: no such file", path));
+                    return;
+                };
+                d
+            }
+            None => self.take_stdin(),
         };
         let mut hits = 0usize;
         for (i, line) in data.lines().enumerate() {
@@ -975,14 +1030,22 @@ where
     fn cmd_sort(&mut self, args: &[String]) {
         let reverse = args.iter().any(|a| a == "-r");
         let file = args.iter().find(|a| !a.starts_with('-'));
-        let Some(f) = file else {
-            self.emit("sort: missing file");
-            return;
-        };
-        let path = self.resolve(Some(f));
-        let Some(data) = self.fs.read_to_string(&path) else {
-            self.emit(&format!("sort: {}: no such file", path));
-            return;
+        let data = match file {
+            Some(f) => {
+                let path = self.resolve(Some(f));
+                let Some(d) = self.fs.read_to_string(&path) else {
+                    self.emit(&format!("sort: {}: no such file", path));
+                    return;
+                };
+                d
+            }
+            None => {
+                if self.pending_stdin.is_none() {
+                    self.emit("sort: missing file");
+                    return;
+                }
+                self.take_stdin()
+            }
         };
         let mut lines: Vec<String> = data.lines().map(str::to_string).collect();
         lines.sort();
@@ -995,14 +1058,22 @@ where
     }
 
     fn cmd_uniq(&mut self, args: &[String]) {
-        let Some(f) = args.first() else {
-            self.emit("uniq: missing file");
-            return;
-        };
-        let path = self.resolve(Some(f));
-        let Some(data) = self.fs.read_to_string(&path) else {
-            self.emit(&format!("uniq: {}: no such file", path));
-            return;
+        let data = match args.first() {
+            Some(f) => {
+                let path = self.resolve(Some(f));
+                let Some(d) = self.fs.read_to_string(&path) else {
+                    self.emit(&format!("uniq: {}: no such file", path));
+                    return;
+                };
+                d
+            }
+            None => {
+                if self.pending_stdin.is_none() {
+                    self.emit("uniq: missing file");
+                    return;
+                }
+                self.take_stdin()
+            }
         };
         let mut prev: Option<&str> = None;
         for line in data.lines() {
@@ -1609,6 +1680,15 @@ mod tests {
         assert!(o.contains("/etc"));
         assert!(o.contains("1\n2\n3"));
         assert!(o.contains("1\n3\n5"));
+    }
+
+    #[test]
+    fn pipeline_wires_stdin() {
+        let (mut sh, out) = shell(&["seq 3 | grep 2", "cat /tmp/multi | wc", "exit"]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("2\n"), "{}", o);
+        assert!(o.contains("3 3 9"), "{}", o);
     }
 
     #[test]
