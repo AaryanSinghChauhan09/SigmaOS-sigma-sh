@@ -157,8 +157,16 @@ impl Fs for SysFs {
         sys::api::stat(path).ok().map(|s| (s.is_dir(), s.size))
     }
 
+    fn chdir(&self, path: &str) -> bool {
+        sys::api::chdir(path).is_ok()
+    }
+
     fn cwd(&self) -> String {
-        "/".to_string()
+        let mut buf = [0u8; 128];
+        match sys::api::getcwd(&mut buf) {
+            Ok(n) => String::from_utf8_lossy(&buf[..n]).into_owned(),
+            Err(_) => "/".to_string(),
+        }
     }
 }
 

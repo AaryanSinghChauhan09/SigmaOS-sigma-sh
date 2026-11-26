@@ -55,6 +55,10 @@ pub trait Fs {
     fn stat(&self, _path: &str) -> Option<(bool, u64)> {
         None
     }
+    /// Change the process working directory. Default: unsupported.
+    fn chdir(&self, _path: &str) -> bool {
+        false
+    }
     /// Current directory.
     fn cwd(&self) -> String;
 }
@@ -722,6 +726,8 @@ where
         let is_back = args.first().is_some_and(|a| a == "-");
         match self.fs.list(&norm) {
             Some(_) => {
+                // Sync the kernel cwd so spawned children inherit it.
+                let _ = self.fs.chdir(&norm);
                 self.oldpwd = Some(core::mem::replace(&mut self.cwd, norm.clone()));
                 if is_back {
                     self.emit(&norm);
