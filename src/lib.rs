@@ -1159,6 +1159,10 @@ where
             "nl" => self.cmd_nl(&args),
             "xargs" => self.cmd_xargs(&args),
             "paste" => self.cmd_paste(&args),
+            "od" => self.cmd_od(&args),
+            "fold" => self.cmd_fold(&args),
+            "expand" => self.cmd_expand_unexpand(&args, false),
+            "unexpand" => self.cmd_expand_unexpand(&args, true),
             "tee" => self.cmd_tee(&args),
             "env" => self.cmd_env(&args),
             "sleep" => self.cmd_sleep(&args),
@@ -1259,6 +1263,9 @@ where
             "  nl [file]         number lines",
             "  xargs [-I S] [-n N] CMD  run CMD per stdin line",
             "  paste [-dC] <file>...  join lines of files with a delim",
+            "  od [-c] [-An] <file>   octal/char dump of a file or stdin",
+            "  fold [-w N] <file>     wrap long lines at column N",
+            "  expand/unexpand [-t N]  tabs<->spaces",
             "  tee [-a] <file>   copy stdin to file(s) and stdout",
             "  env              list environment variables",
             "  sleep <secs>     pause execution",
@@ -2084,6 +2091,194 @@ where
         }
     }
 
+    /// Read command input as bytes: file arg or piped stdin.
+    fn input_bytes(&mut self, args: &[String], name: &str) -> Option<Vec<u8>> {
+        match args.first() {
+            Some(f) => {
+                let path = self.resolve(Some(f));
+                match self.fs.read_to_string(&path) {
+                    Some(d) => Some(d.into_bytes()),
+                    None => {
+                        self.emit(&format!("{}: {}: no such file", name, path));
+                        None
+                    }
+                }
+            }
+            None => {
+                if self.pending_stdin.is_none() {
+                    self.emit(&format!("{}: missing file", name));
+                    return None;
+                }
+                Some(self.take_stdin().into_bytes())
+            }
+        }
+    }
+
+    /// `od [-c] [-An] [file]` — octal dump: offset, hex bytes, ASCII.
+    /// `-c` shows chars/escapes instead of hex.
+    fn cmd_od(&mut self, args: &[String]) {
+        let mut chars = false;
+        let mut no_addr = false;
+        let mut file: Option<&String> = None;
+        for a in args {
+            match a.as_str() {
+                "-c" => chars = true,
+                "-An" | "-A" | "-tx1" | "-tx1z" => no_addr |= a == "-An",
+                _ if file.is_none() => file = Some(a),
+                _ => {}
+            }
+        }
+        let fargs: Vec<String> = file.map(|f| alloc::vec![f.clone()]).unwrap_or_default();
+        let Some(data) = self.input_bytes(&fargs, "od") else {
+            return;
+        };
+        for (off, chunk) in data.chunks(16).enumerate() {
+            let mut line = String::new();
+            if !no_addr {
+                line.push_str(&format!("{:07o} ", off * 16));
+            }
+            if chars {
+                for &b in chunk {
+                    let c = match b {
+                        b'\\' => "\\\\".to_string(),
+                        0 => " \\0".to_string(),
+                        7 => " \\a".to_string(),
+                        8 => " \\b".to_string(),
+                        9 => " \\t".to_string(),
+                        10 => " \\n".to_string(),
+                        11 => " \\v".to_string(),
+                        12 => " \\f".to_string(),
+                        13 => " \\r".to_string(),
+                        32..=126 => format!("  {}", b as char),
+                        _ => format!("{:3o}", b),
+                    };
+                    line.push_str(&c);
+                }
+            } else {
+                for &b in chunk {
+                    line.push_str(&format!(" {:02x}", b));
+                }
+                line.push_str("  |");
+                for &b in chunk {
+                    line.push(if (32..=126).contains(&b) {
+                        b as char
+                    } else {
+                        '.'
+                    });
+                }
+                line.push('|');
+            }
+            self.emit(&line);
+        }
+    }
+
+    /// `fold [-w N] [file]` — wrap lines longer than N columns.
+    fn cmd_fold(&mut self, args: &[String]) {
+        let mut width = 80usize;
+        let mut file: Option<&String> = None;
+        let mut i = 0;
+        while i < args.len() {
+            if args[i] == "-w" && i + 1 < args.len() {
+                width = args[i + 1].parse().unwrap_or(80).max(1);
+                i += 2;
+            } else if let Some(rest) = args[i].strip_prefix("-w") {
+                if !rest.is_empty() {
+                    width = rest.parse().unwrap_or(80).max(1);
+                }
+                i += 1;
+            } else if file.is_none() {
+                file = Some(&args[i]);
+                i += 1;
+            } else {
+                i += 1;
+            }
+        }
+        let fargs: Vec<String> = file.map(|f| alloc::vec![f.clone()]).unwrap_or_default();
+        let Some(data) = self.input_bytes(&fargs, "fold") else {
+            return;
+        };
+        let text = String::from_utf8_lossy(&data);
+        for line in text.lines() {
+            let chars: Vec<char> = line.chars().collect();
+            if chars.len() <= width {
+                self.emit(line);
+            } else {
+                for w in chars.chunks(width) {
+                    self.emit(&w.iter().collect::<String>());
+                }
+            }
+        }
+    }
+
+    /// `expand [-t N] [file]` — tabs to spaces (tab stops every N,
+    /// default 8). `unexpand` converts leading runs of spaces to tabs.
+    fn cmd_expand_unexpand(&mut self, args: &[String], unexpand: bool) {
+        let name = if unexpand { "unexpand" } else { "expand" };
+        let mut tab = 8usize;
+        let mut file: Option<&String> = None;
+        let mut i = 0;
+        while i < args.len() {
+            if (args[i] == "-t" || args[i] == "--tabs") && i + 1 < args.len() {
+                tab = args[i + 1].parse().unwrap_or(8).max(1);
+                i += 2;
+            } else if let Some(rest) = args[i].strip_prefix("-t") {
+                if !rest.is_empty() {
+                    tab = rest.parse().unwrap_or(8).max(1);
+                }
+                i += 1;
+            } else if file.is_none() {
+                file = Some(&args[i]);
+                i += 1;
+            } else {
+                i += 1;
+            }
+        }
+        let fargs: Vec<String> = file.map(|f| alloc::vec![f.clone()]).unwrap_or_default();
+        let Some(data) = self.input_bytes(&fargs, name) else {
+            return;
+        };
+        let text = String::from_utf8_lossy(&data);
+        if !unexpand {
+            for line in text.lines() {
+                let mut out = String::new();
+                let mut col = 0usize;
+                for c in line.chars() {
+                    if c == '\t' {
+                        let n = tab - col % tab;
+                        out.extend(core::iter::repeat_n(' ', n));
+                        col += n;
+                    } else {
+                        out.push(c);
+                        col += 1;
+                    }
+                }
+                self.emit(&out);
+            }
+        } else {
+            for line in text.lines() {
+                // Leading blanks -> tabs at tab stops (POSIX default):
+                // a tab replaces a run of spaces reaching the next stop.
+                let mut out = String::new();
+                let spaces = line.bytes().take_while(|&b| b == b' ').count();
+                let mut pos = 0usize;
+                let mut rem = spaces;
+                while rem > 0 {
+                    let dist = tab - pos % tab;
+                    if rem >= dist {
+                        out.push('\t');
+                        pos += dist;
+                        rem -= dist;
+                    } else {
+                        out.extend(core::iter::repeat_n(' ', rem));
+                        rem = 0;
+                    }
+                }
+                out.push_str(&line[spaces..]);
+                self.emit(&out);
+            }
+        }
+    }
+
     /// `xargs [-I STR] [-n N] CMD [ARGS...]` — run CMD once per
     /// stdin line (or per group of N lines with -n), appending the
     /// line(s) as arguments. `-I STR` replaces STR inside the fixed
@@ -2600,6 +2795,8 @@ mod tests {
                 "/etc/hostname" => Some("sigmaos\n".to_string()),
                 "/tmp/multi" => Some("l1\nl2\nl3\n".to_string()),
                 "/tmp/dups" => Some("b\na\na\nc\n".to_string()),
+                "/tmp/tabs" => Some("a\tb\n        indented\n".to_string()),
+                "/tmp/long" => Some("abcdefghijklmnop\n".to_string()),
                 _ => None,
             }
         }
@@ -3349,5 +3546,35 @@ mod tests {
         let o = out.borrow();
         assert!(o.contains("x\n"));
         assert!(o.contains("y\n"));
+    }
+
+    #[test]
+    fn od_hex_and_chars() {
+        let (mut sh, out) = shell(&["od /tmp/multi", "od -c /tmp/multi", "exit"]);
+        sh.run();
+        let o = out.borrow();
+        // "l1\nl2\nl3\n" = 6c 31 0a ...
+        assert!(o.contains("6c 31 0a"));
+        assert!(o.contains("\\n"));
+    }
+
+    #[test]
+    fn fold_wraps_long_lines() {
+        let (mut sh, out) = shell(&["fold -w 8 /tmp/long", "exit"]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("abcdefgh"));
+        assert!(o.contains("ijklmnop"));
+    }
+
+    #[test]
+    fn expand_and_unexpand() {
+        let (mut sh, out) = shell(&["expand /tmp/tabs", "unexpand /tmp/tabs", "exit"]);
+        sh.run();
+        let o = out.borrow();
+        // tab after 'a' expands to 7 spaces (col 1 -> stop 8)
+        assert!(o.contains("a       b"));
+        // 8 leading spaces collapse to one tab
+        assert!(o.contains("\tindented"));
     }
 }
