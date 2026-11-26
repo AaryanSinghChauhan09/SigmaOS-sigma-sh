@@ -153,6 +153,36 @@ pub fn split_semicolons(line: &str) -> Vec<String> {
     parts
 }
 
+/// Split a line on `&&` outside double quotes.
+pub fn split_and(line: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                in_quote = !in_quote;
+                cur.push(c);
+            }
+            '&' if !in_quote && chars.peek() == Some(&'&') => {
+                chars.next();
+                let t = cur.trim();
+                if !t.is_empty() {
+                    parts.push(t.to_string());
+                }
+                cur.clear();
+            }
+            _ => cur.push(c),
+        }
+    }
+    let t = cur.trim();
+    if !t.is_empty() {
+        parts.push(t.to_string());
+    }
+    parts
+}
+
 /// The shell.
 pub struct Shell<I, F, P, M, S> {
     pub io: I,
@@ -164,6 +194,7 @@ pub struct Shell<I, F, P, M, S> {
     pub oldpwd: Option<String>,
     pub history: Vec<String>,
     pub env: Vec<(String, String)>,
+    pub last_ok: bool,
     pub running: bool,
 }
 
@@ -187,6 +218,7 @@ where
             oldpwd: None,
             history: Vec::new(),
             env: Vec::new(),
+            last_ok: true,
             running: true,
         }
     }
@@ -222,6 +254,21 @@ where
             }
             return;
         }
+        // `&&` runs the next command only if the previous succeeded.
+        let and_parts = split_and(line);
+        if and_parts.len() > 1 {
+            let mut first = true;
+            for part in and_parts {
+                if !self.running {
+                    break;
+                }
+                if first || self.last_ok {
+                    self.execute(&part);
+                }
+                first = false;
+            }
+            return;
+        }
         // Try to parse as pipeline first
         if let Some(pipeline) = parse_pipeline(line) {
             self.execute_pipeline(&pipeline);
@@ -233,6 +280,7 @@ where
             return;
         };
         let cmd = self.expand_command(cmd);
+        self.last_ok = is_builtin(&cmd.name);
         match cmd.name.as_str() {
             "help" | "?" => self.cmd_help(),
             "exit" | "logout" | "quit" => self.running = false,
@@ -325,6 +373,7 @@ where
 
     /// Execute a single command (helper for pipelines).
     fn execute_single_command(&mut self, cmd: &Command) {
+        self.last_ok = is_builtin(&cmd.name);
         match cmd.name.as_str() {
             "help" | "?" => self.cmd_help(),
             "exit" | "logout" | "quit" => self.running = false,
@@ -578,6 +627,37 @@ where
     }
 }
 
+/// Names dispatched by the shell (used for `&&` success tracking).
+fn is_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "help"
+            | "?"
+            | "exit"
+            | "logout"
+            | "quit"
+            | "echo"
+            | "pwd"
+            | "cd"
+            | "ls"
+            | "cat"
+            | "which"
+            | "history"
+            | "export"
+            | "unset"
+            | "mem"
+            | "ps"
+            | "time"
+            | "uptime"
+            | "launch"
+            | "run"
+            | "reboot"
+            | "jobs"
+            | "fg"
+            | "bg"
+    )
+}
+
 fn format_u64(v: u64) -> String {
     v.to_string()
 }
@@ -769,6 +849,19 @@ mod tests {
         assert!(o.contains("one"));
         assert!(o.contains("two"));
         assert!(o.contains("a;b"));
+    }
+
+    #[test]
+    fn and_and_skips_after_failure() {
+        let (mut sh, out) = shell(&[
+            "nosuchcmd && echo should_not_print",
+            "echo ok && echo yes",
+            "exit",
+        ]);
+        sh.run();
+        let o = out.borrow();
+        assert!(!o.contains("should_not_print"));
+        assert!(o.contains("yes"));
     }
 
     #[test]
