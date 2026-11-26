@@ -229,10 +229,7 @@ pub extern "C" fn _start() -> ! {
 
 fn main_inner() -> ! {
     sys::arch::install();
-    let _ = sys::api::print("sh: rust main reached\n");
-    let _ = sys::api::print("sh: pre-shell\n");
     let mut shell = Shell::new(SysIo, SysFs, SysProcs, SysMem, SysSystem);
-    let _ = sys::api::print("sh: shell constructed\n");
     shell.run();
     sys::api::exit(0);
 }
