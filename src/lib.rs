@@ -1,7 +1,8 @@
 //! SigmaOS sigma-sh — minimal rescue shell.
 //!
 //! Builtins: help, ls, pwd, cd, echo, cat, which, history, export, unset,
-//! mem, ps, time, launch, reboot, plus `*` glob expansion in arguments.
+//! mem, ps, time, launch, reboot, true/false/:/clear, plus `*` glob
+//! expansion in arguments. `launch` resolves bare names through PATH.
 //! exit. I/O and filesystem access go through traits so the shell is
 //! fully testable on host and pluggable to sigma-sys at runtime.
 
@@ -350,6 +351,9 @@ where
         match cmd.name.as_str() {
             "help" | "?" => self.cmd_help(),
             "exit" | "logout" | "quit" => self.running = false,
+            "true" | ":" => {}
+            "false" => self.last_ok = false,
+            "clear" => self.io.write("\x1b[2J\x1b[H"),
             "echo" => self.io.writeln(&cmd.args.join(" ")),
             "pwd" => self.io.writeln(&self.cwd),
             "cd" => self.cmd_cd(&cmd.args),
@@ -370,6 +374,10 @@ where
             _ => self
                 .io
                 .writeln(&format!("sigma-sh: {}: command not found", cmd.name)),
+        }
+        // `false` and unknown commands fail; other builtins succeed.
+        if is_builtin(&cmd.name) && cmd.name != "false" {
+            self.last_ok = true;
         }
     }
 
@@ -486,6 +494,9 @@ where
         match cmd.name.as_str() {
             "help" | "?" => self.cmd_help(),
             "exit" | "logout" | "quit" => self.running = false,
+            "true" | ":" => {}
+            "false" => self.last_ok = false,
+            "clear" => self.io.write("\x1b[2J\x1b[H"),
             "echo" => self.io.writeln(&cmd.args.join(" ")),
             "pwd" => self.io.writeln(&self.cwd),
             "cd" => self.cmd_cd(&cmd.args),
@@ -507,6 +518,9 @@ where
                 .io
                 .writeln(&format!("sigma-sh: {}: command not found", cmd.name)),
         }
+        if is_builtin(&cmd.name) && cmd.name != "false" {
+            self.last_ok = true;
+        }
     }
 
     fn cmd_help(&mut self) {
@@ -522,6 +536,8 @@ where
             "  history         list command history",
             "  export V=val    set an environment variable",
             "  unset V         remove an environment variable",
+            "  true/:/false    no-op / fail (for && and ||)",
+            "  clear           clear the screen",
             "  mem             memory usage",
             "  ps              process list",
             "  time            uptime seconds",
@@ -696,6 +712,24 @@ where
             self.io.writeln("launch: missing program");
             return;
         };
+        // Bare names resolve through PATH dirs, like a real shell.
+        let resolved;
+        let prog = if prog.contains('/') {
+            prog.as_str()
+        } else {
+            resolved = Self::WHICH_PATH
+                .iter()
+                .find_map(|dir| {
+                    let p = format!("{}/{}", dir, prog);
+                    let (d, b) = p.rsplit_once('/')?;
+                    self.fs
+                        .list(d)
+                        .is_some_and(|names| names.iter().any(|n| n == b))
+                        .then_some(p)
+                })
+                .unwrap_or_else(|| prog.clone());
+            resolved.as_str()
+        };
         match self.sys.launch(prog, &args[1..]) {
             Ok(pid) => self.io.writeln(&format!("launched {} (pid {})", prog, pid)),
             Err(e) => self.io.writeln(&format!("launch: {}: {}", prog, e)),
@@ -757,6 +791,10 @@ fn is_builtin(name: &str) -> bool {
             | "exit"
             | "logout"
             | "quit"
+            | "true"
+            | ":"
+            | "false"
+            | "clear"
             | "echo"
             | "pwd"
             | "cd"
@@ -996,6 +1034,32 @@ mod tests {
         let o = out.borrow();
         assert!(o.contains("fallback"));
         assert!(!o.contains("skipped"));
+    }
+
+    #[test]
+    fn true_false_drive_and_or() {
+        let (mut sh, out) = shell(&[
+            "true && echo yep",
+            "false && echo nope",
+            "false || echo fallback",
+            ": && echo colon-ok",
+            "exit",
+        ]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("yep"));
+        assert!(!o.contains("nope"));
+        assert!(o.contains("fallback"));
+        assert!(o.contains("colon-ok"));
+    }
+
+    #[test]
+    fn launch_resolves_path() {
+        let (mut sh, out) = shell(&["launch sh arg1", "exit"]);
+        sh.run();
+        let launched = sh.sys.launched.borrow();
+        assert_eq!(launched.as_slice(), &["/bin/sh".to_string()]);
+        assert!(out.borrow().contains("launched /bin/sh (pid 100)"));
     }
 
     #[test]
