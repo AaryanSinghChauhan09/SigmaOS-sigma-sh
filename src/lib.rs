@@ -150,6 +150,33 @@ pub struct Command {
     pub quoted: Vec<u8>,
 }
 
+/// Parse `name() { body; }` — single-line function definition.
+/// Returns (name, body) or None when the line isn't a definition.
+fn parse_func_def(line: &str) -> Option<(String, String)> {
+    let t = line.trim();
+    let paren = t.find("()")?;
+    let name = &t[..paren];
+    let valid = !name.is_empty()
+        && name
+            .chars()
+            .enumerate()
+            .all(|(i, c)| c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit()));
+    if !valid {
+        return None;
+    }
+    let after = t[paren + 2..].trim_start().strip_prefix('{')?;
+    let mut body = after.trim_end();
+    // Optional `;` before the closing brace's line end.
+    if body.ends_with(';') {
+        body = body[..body.len() - 1].trim_end();
+    }
+    let body = body.strip_suffix('}')?.trim();
+    if body.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), body.to_string()))
+}
+
 /// A pipeline of commands connected by pipes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pipeline {
@@ -650,6 +677,17 @@ pub struct Shell<I, F, P, M, S> {
     /// Pipe fd to use as the next launch stage's stdout (0 = none).
     pub pipe_out_fd: i64,
     pub running: bool,
+    /// User functions: (name, body) defined by `name() { ...; }`.
+    pub functions: Vec<(String, String)>,
+    /// Positional params ($1..$9, $#, $@) for the active function.
+    pub params: Vec<String>,
+    /// Set by `return`; aborts the innermost function body's command
+    /// loops. Cleared at each function-call boundary.
+    pub ret_flag: bool,
+    /// >0 while executing a function body (gates `return`).
+    pub fn_depth: usize,
+    /// Set by `command` — bypasses function lookup for one dispatch.
+    pub in_command: bool,
 }
 
 impl<I, F, P, M, S> Shell<I, F, P, M, S>
@@ -682,6 +720,11 @@ where
             pipe_in_fd: 0,
             pipe_out_fd: 0,
             running: true,
+            functions: Vec::new(),
+            params: Vec::new(),
+            ret_flag: false,
+            fn_depth: 0,
+            in_command: false,
         }
     }
 
@@ -706,11 +749,18 @@ where
 
     /// Execute one command line.
     pub fn execute(&mut self, line: &str) {
-        // `;` separates commands (quote-aware).
+        // `name() { ...; }` function definition (single line).
+        if let Some((name, body)) = parse_func_def(line) {
+            self.functions.retain(|(n, _)| *n != name);
+            self.functions.push((name, body));
+            return;
+        }
+        // `;` separates commands (quote-aware). A lone trailing `;`
+        // also counts — otherwise parse() would keep it as an arg.
         let parts = split_semicolons(line);
-        if parts.len() > 1 {
+        if parts.len() > 1 || parts.first().is_some_and(|p| p.as_str() != line.trim()) {
             for part in parts {
-                if self.running {
+                if self.running && !self.ret_flag {
                     self.execute(&part);
                 }
             }
@@ -718,10 +768,10 @@ where
         }
         // `||` runs the next command only if the previous failed.
         let or_parts = split_or(line);
-        if or_parts.len() > 1 {
+        if or_parts.len() > 1 || or_parts.first().is_some_and(|p| p.as_str() != line.trim()) {
             let mut first = true;
             for part in or_parts {
-                if !self.running {
+                if !self.running || self.ret_flag {
                     break;
                 }
                 if first || !self.last_ok {
@@ -733,10 +783,10 @@ where
         }
         // `&&` runs the next command only if the previous succeeded.
         let and_parts = split_and(line);
-        if and_parts.len() > 1 {
+        if and_parts.len() > 1 || and_parts.first().is_some_and(|p| p.as_str() != line.trim()) {
             let mut first = true;
             for part in and_parts {
-                if !self.running {
+                if !self.running || self.ret_flag {
                     break;
                 }
                 if first || self.last_ok {
@@ -796,7 +846,7 @@ where
         let mut shell_fds: Vec<i64> = Vec::new(); // shell copies to close at end
 
         for (i, cmd) in cmds.iter().enumerate() {
-            if !self.running {
+            if !self.running || self.ret_flag {
                 break;
             }
             let last = i + 1 == n;
@@ -1007,6 +1057,17 @@ where
                 i += 1;
                 continue;
             }
+            // `$#`, `$@`, `$*` — positional param specials.
+            if i + 1 < chars.len() && matches!(chars[i + 1], '#' | '@' | '*') {
+                let c = chars[i + 1];
+                i += 2;
+                match c {
+                    '#' => out.push_str(&self.params.len().to_string()),
+                    '@' | '*' => out.push_str(&self.params.join(" ")),
+                    _ => unreachable!(),
+                }
+                continue;
+            }
             let name = if i + 1 < chars.len() && chars[i + 1] == '{' {
                 let mut j = i + 2;
                 let mut n = String::new();
@@ -1028,6 +1089,17 @@ where
             };
             if name.is_empty() {
                 out.push('$');
+                continue;
+            }
+            // Positional params `$1`..`$N` (and `${1}`).
+            if name.bytes().all(|b| b.is_ascii_digit()) {
+                if let Ok(n) = name.parse::<usize>() {
+                    if n >= 1 {
+                        if let Some(v) = self.params.get(n - 1) {
+                            out.push_str(v);
+                        }
+                    }
+                }
                 continue;
             }
             if let Some((_, v)) = self.env.iter().find(|(k, _)| *k == name) {
@@ -1235,7 +1307,15 @@ where
             self.redirect_initialized = false;
         }
         self.last_ok = true;
-        match cmd.name.as_str() {
+        // User functions take precedence over builtins (POSIX);
+        // `command` suppresses the lookup for one dispatch.
+        let is_func = !self.in_command && self.functions.iter().any(|(n, _)| *n == cmd.name);
+        match if is_func {
+            "\u{7}fn"
+        } else {
+            cmd.name.as_str()
+        } {
+            "\u{7}fn" => self.call_function(&cmd.name, &args),
             "help" | "?" => self.cmd_help(),
             "exit" | "logout" | "quit" => self.running = false,
             "true" | ":" => {}
@@ -1332,6 +1412,26 @@ where
                 self.cmd_launch(&args, fd, stdin_fd, stderr_fd);
             }
             "wait" => self.cmd_wait(&args),
+            "return" => {
+                if self.fn_depth == 0 {
+                    self.last_ok = false;
+                    self.emit("return: can only return from a function");
+                } else {
+                    self.ret_flag = true;
+                    if let Some(n) = args.first().and_then(|a| a.parse::<i64>().ok()) {
+                        self.last_ok = n == 0;
+                    }
+                }
+            }
+            "shift" => {
+                let n = args
+                    .first()
+                    .and_then(|a| a.parse::<usize>().ok())
+                    .unwrap_or(1);
+                let n = n.min(self.params.len());
+                self.params.drain(..n);
+            }
+            "command" => self.cmd_command(&args),
             "reboot" => self.sys.reboot(),
             "jobs" => self.cmd_jobs(),
             "fg" => self.cmd_fg(&args),
@@ -1343,6 +1443,48 @@ where
         }
         self.pending_stdin = None;
         self.redirect = prev_redir;
+    }
+
+    /// `command NAME [ARGS...]` — run NAME bypassing function lookup
+    /// (the POSIX escape from a function that shadows a builtin).
+    fn cmd_command(&mut self, args: &[String]) {
+        let Some((name, rest)) = args.split_first() else {
+            self.emit("command: usage: command NAME [ARGS...]");
+            return;
+        };
+        if name.starts_with('-') {
+            self.emit("command: options not supported");
+            return;
+        }
+        let c = Command {
+            name: name.clone(),
+            args: rest.to_vec(),
+            quoted: alloc::vec![0; rest.len()],
+        };
+        self.in_command = true;
+        self.execute_single_command(&c);
+        self.in_command = false;
+    }
+
+    /// Invoke a user function: save/restore positional params, track
+    /// fn_depth for `return`, and clear ret_flag at the boundary.
+    fn call_function(&mut self, name: &str, fargs: &[String]) {
+        let Some(body) = self
+            .functions
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, b)| b.clone())
+        else {
+            return;
+        };
+        let saved_params = core::mem::take(&mut self.params);
+        self.params = fargs.to_vec();
+        self.fn_depth += 1;
+        self.ret_flag = false;
+        self.execute(&body);
+        self.fn_depth -= 1;
+        self.ret_flag = false;
+        self.params = saved_params;
     }
 
     fn cmd_help(&mut self) {
@@ -3717,5 +3859,42 @@ mod tests {
         assert!(o.contains("> x\n"), "OUT: {o}");
         assert!(o.contains("> $(echo lit)\n"), "OUT: {o}");
         assert!(o.contains("> dq\n"), "OUT: {o}");
+    }
+
+    #[test]
+    fn shell_functions() {
+        let (mut sh, out) = shell(&[
+            "greet() { echo hello; }",
+            "greet",
+            "show() { echo $1-$2-$#-$@; }",
+            "show a b",
+            "early() { echo before; return 3; echo after; }",
+            "early",
+            "echo still-running",
+            "nest() { inner \"$@\"; }",
+            "inner() { echo deep-$1; }",
+            "nest arg",
+            "shft() { shift; echo now-$1; }",
+            "shft x y",
+            "exit",
+        ]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("> hello\n"), "OUT: {o}");
+        assert!(o.contains("> a-b-2-a b\n"), "OUT: {o}");
+        assert!(o.contains("> before\n"), "OUT: {o}");
+        assert!(!o.contains("after"), "OUT: {o}");
+        assert!(o.contains("> still-running\n"), "OUT: {o}");
+        assert!(o.contains("> deep-arg\n"), "OUT: {o}");
+        assert!(o.contains("> now-y\n"), "OUT: {o}");
+    }
+
+    #[test]
+    fn function_overrides_builtin() {
+        // `command` bypasses the function and reaches the builtin.
+        let (mut sh, out) = shell(&["echo() { command echo custom-$1; }", "echo hi", "exit"]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("> custom-hi\n"), "OUT: {o}");
     }
 }
