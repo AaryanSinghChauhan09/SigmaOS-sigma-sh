@@ -292,6 +292,8 @@ pub struct Shell<I, F, P, M, S> {
     pub pending_stdin: Option<String>,
     /// Pid of the most recently launched program (for bare `wait`).
     pub last_pid: Option<i64>,
+    /// Launched jobs: (pid, command line, reaped flag).
+    pub jobs: Vec<(i64, String, bool)>,
     pub running: bool,
 }
 
@@ -321,6 +323,7 @@ where
             capture: None,
             pending_stdin: None,
             last_pid: None,
+            jobs: Vec::new(),
             running: true,
         }
     }
@@ -1332,6 +1335,9 @@ where
         match self.sys.launch(prog, &args[1..], &envp) {
             Ok(pid) => {
                 self.last_pid = Some(pid);
+                if self.jobs.len() < 32 {
+                    self.jobs.push((pid, prog.to_string(), false));
+                }
                 self.emit(&format!("launched {} (pid {})", prog, pid));
             }
             Err(e) => self.emit(&format!("launch: {}: {}", prog, e)),
@@ -1361,6 +1367,11 @@ where
         };
         match self.sys.wait(pid) {
             Ok(status) => {
+                for j in self.jobs.iter_mut() {
+                    if j.0 == pid {
+                        j.2 = true;
+                    }
+                }
                 self.emit(&format!("wait: pid {} exited {}", pid, status));
             }
             Err(e) => {
@@ -1370,19 +1381,88 @@ where
         }
     }
 
-    /// Job control: list background jobs (stub for now)
+    /// `jobs` — list launched jobs. Children already run concurrently
+    /// under the kernel scheduler, so "background" is the default;
+    /// entries are marked reaped once `wait`/`fg` collects them.
     fn cmd_jobs(&mut self) {
-        self.emit("jobs: no background jobs (job control not implemented)");
+        if self.jobs.is_empty() {
+            self.emit("jobs: no jobs");
+            return;
+        }
+        let jobs: Vec<String> = self
+            .jobs
+            .iter()
+            .enumerate()
+            .map(|(i, (pid, cmd, reaped))| {
+                let state = if *reaped { "done" } else { "running" };
+                format!("[{}] {:>4} {} {}", i + 1, pid, state, cmd)
+            })
+            .collect();
+        for line in jobs {
+            self.emit(&line);
+        }
     }
 
-    /// Job control: bring job to foreground (stub for now)
-    fn cmd_fg(&mut self, _args: &[String]) {
-        self.emit("fg: job control not implemented");
+    /// `fg <pid|job#>` — block until the job exits (wait semantics);
+    /// there is no terminal foreground/background distinction in the
+    /// serial console, so fg == wait on the chosen job.
+    fn cmd_fg(&mut self, args: &[String]) {
+        let Some(sel) = args.first() else {
+            self.emit("fg: missing job");
+            self.last_ok = false;
+            return;
+        };
+        let pid = match self.job_pid(sel) {
+            Some(p) => p,
+            None => {
+                self.emit(&format!("fg: {}: no such job", sel));
+                self.last_ok = false;
+                return;
+            }
+        };
+        match self.sys.wait(pid) {
+            Ok(status) => {
+                for j in self.jobs.iter_mut() {
+                    if j.0 == pid {
+                        j.2 = true;
+                    }
+                }
+                self.emit(&format!("fg: pid {} exited {}", pid, status));
+            }
+            Err(e) => {
+                self.emit(&format!("fg: {}: {}", pid, e));
+                self.last_ok = false;
+            }
+        }
     }
 
-    /// Job control: send job to background (stub for now)
-    fn cmd_bg(&mut self, _args: &[String]) {
-        self.emit("bg: job control not implemented");
+    /// `bg <pid|job#>` — children are already scheduled concurrently,
+    /// so this just confirms the job keeps running.
+    fn cmd_bg(&mut self, args: &[String]) {
+        let Some(sel) = args.first() else {
+            self.emit("bg: missing job");
+            self.last_ok = false;
+            return;
+        };
+        match self.job_pid(sel) {
+            Some(pid) => self.emit(&format!("bg: pid {} already running", pid)),
+            None => {
+                self.emit(&format!("bg: {}: no such job", sel));
+                self.last_ok = false;
+            }
+        }
+    }
+
+    /// Resolve a job selector — pid digits or 1-based `[n]` index.
+    fn job_pid(&self, sel: &str) -> Option<i64> {
+        if let Ok(n) = sel.parse::<usize>() {
+            if (1..=self.jobs.len()).contains(&n) {
+                return Some(self.jobs[n - 1].0);
+            }
+        }
+        sel.parse::<i64>()
+            .ok()
+            .and_then(|p| self.jobs.iter().find(|j| j.0 == p).map(|j| j.0))
     }
 }
 
@@ -1600,6 +1680,26 @@ mod tests {
         let o = out.borrow();
         assert!(o.contains("wait: pid 100 exited 0"));
         assert!(o.contains("wait: pid 7 exited 0"));
+    }
+
+    #[test]
+    fn jobs_fg_bg_track_launched() {
+        let (mut sh, out) = shell(&[
+            "launch /bin/sh arg1",
+            "jobs",
+            "fg 1",
+            "jobs",
+            "bg 100",
+            "fg 99",
+            "exit",
+        ]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("[1]  100 running /bin/sh"));
+        assert!(o.contains("fg: pid 100 exited 0"));
+        assert!(o.contains("[1]  100 done /bin/sh"));
+        assert!(o.contains("bg: pid 100 already running"));
+        assert!(o.contains("fg: 99: no such job"));
     }
 
     #[test]
