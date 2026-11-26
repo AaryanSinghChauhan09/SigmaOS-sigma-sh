@@ -149,6 +149,7 @@ impl System for StdSys {
         env: &[String],
         _stdout_fd: i64,
         _stdin_fd: i64,
+        _stderr_fd: i64,
     ) -> Result<i64, String> {
         let p = if Path::new(path).is_absolute() {
             path.to_string()

@@ -246,6 +246,7 @@ impl System for SysSystem {
         env: &[String],
         stdout_fd: i64,
         stdin_fd: i64,
+        stderr_fd: i64,
     ) -> Result<i64, String> {
         let arg_refs: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
         let env_refs: Vec<&[u8]> = env.iter().map(|e| e.as_bytes()).collect();
@@ -255,6 +256,7 @@ impl System for SysSystem {
             &env_refs,
             stdout_fd.max(0) as u64,
             stdin_fd.max(0) as u64,
+            stderr_fd.max(0) as u64,
         )
         .map(|pid| pid as i64)
         .map_err(|e| format!("spawn failed ({})", e))

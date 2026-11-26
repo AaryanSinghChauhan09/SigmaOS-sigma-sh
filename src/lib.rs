@@ -97,6 +97,7 @@ pub trait System {
         env: &[String],
         stdout_fd: i64,
         stdin_fd: i64,
+        stderr_fd: i64,
     ) -> Result<i64, String>;
     /// Wait for `pid` to exit; returns its exit status.
     /// Default: unsupported.
@@ -580,9 +581,32 @@ where
                 args.remove(i);
             }
         }
+        // `2>`/`2>>` stderr redirection (launch only; same fd mechanism).
+        let mut err_redir = None;
+        if let Some(i) = args
+            .iter()
+            .position(|a| a == "2>" || a == "2>>" || a.starts_with("2>") && a.len() > 2)
+        {
+            let tok = args[i].clone();
+            let (inline, append) = if tok == "2>" || tok == "2>>" {
+                (None, tok == "2>>")
+            } else if let Some(rest) = tok.strip_prefix("2>>") {
+                (Some(rest.to_string()), true)
+            } else {
+                (tok.strip_prefix("2>").map(str::to_string), false)
+            };
+            let has_inline = inline.is_some();
+            if let Some(target) = inline.or_else(|| args.get(i + 1).cloned()) {
+                err_redir = Some((self.resolve(Some(&target)), append));
+                args.drain(i..=i + usize::from(!has_inline));
+            } else {
+                args.remove(i);
+            }
+        }
         // `<` input redirection: for `launch` it becomes the child's
         // stdin fd; for builtins it feeds pending_stdin as before.
         let mut stdin_fd = 0i64;
+        let mut stderr_fd = 0i64;
         if let Some(i) = args.iter().position(|a| a == "<") {
             if i + 1 < args.len() {
                 let path = self.resolve(Some(&args[i + 1]));
@@ -682,7 +706,18 @@ where
                     // prev_redir is restored at the end of this fn.
                     self.redirect = None;
                 }
-                self.cmd_launch(&args, fd, stdin_fd);
+                // `2> file`: open the stderr target the same way.
+                if let Some((path, append)) = &err_redir {
+                    match self.fs.open_write(path, *append) {
+                        Some(fd) => stderr_fd = fd,
+                        None => {
+                            self.emit(&format!("launch: {}: cannot open for write", path));
+                            self.last_ok = false;
+                            return;
+                        }
+                    }
+                }
+                self.cmd_launch(&args, fd, stdin_fd, stderr_fd);
             }
             "wait" => self.cmd_wait(&args),
             "reboot" => self.sys.reboot(),
@@ -1366,7 +1401,7 @@ where
         }
     }
 
-    fn cmd_launch(&mut self, args: &[String], stdout_fd: i64, stdin_fd: i64) {
+    fn cmd_launch(&mut self, args: &[String], stdout_fd: i64, stdin_fd: i64, stderr_fd: i64) {
         let Some(prog) = args.first() else {
             self.emit("launch: missing program");
             return;
@@ -1396,7 +1431,7 @@ where
             .collect();
         match self
             .sys
-            .launch(prog, &args[1..], &envp, stdout_fd, stdin_fd)
+            .launch(prog, &args[1..], &envp, stdout_fd, stdin_fd, stderr_fd)
         {
             Ok(pid) => {
                 self.last_pid = Some(pid);
@@ -1658,6 +1693,7 @@ mod tests {
             _env: &[String],
             _stdout_fd: i64,
             _stdin_fd: i64,
+            _stderr_fd: i64,
         ) -> Result<i64, String> {
             self.launched.borrow_mut().push(path.to_string());
             Ok(100)

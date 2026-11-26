@@ -108,6 +108,26 @@ fn main_inner(argc: u64, argv: *const *const u8) -> ! {
         }
     }
     let _ = sys::api::print("\n");
+    // `stderr` arg writes a marker to fd 2 for 2> redirect tests.
+    if !argv.is_null() {
+        for i in 0..argc as usize {
+            let p = unsafe { *argv.add(i) };
+            if p.is_null() {
+                continue;
+            }
+            let mut s = alloc::string::String::new();
+            unsafe {
+                let mut q = p;
+                while *q != 0 && s.len() < 64 {
+                    s.push(*q as char);
+                    q = q.add(1);
+                }
+            }
+            if s == "stderr" {
+                let _ = sys::api::write(2, b"sigma-child: on-stderr\n");
+            }
+        }
+    }
     // Spin for a while so the timer IRQ preempts us and the parent
     // gets scheduled — demonstrates preemptive context switching.
     let mut i = 0u64;
