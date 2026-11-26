@@ -169,6 +169,13 @@ impl System for StdSys {
     fn sleep(&self, secs: u64) {
         std::thread::sleep(std::time::Duration::from_secs(secs));
     }
+    fn kill(&self, pid: i64) -> bool {
+        Proc::new("kill")
+            .arg(pid.to_string())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
 }
 
 fn main() {

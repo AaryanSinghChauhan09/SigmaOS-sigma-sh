@@ -77,6 +77,10 @@ pub trait System {
     fn uptime(&self) -> u64;
     /// Sleep for `secs` seconds. Default: no-op.
     fn sleep(&self, _secs: u64) {}
+    /// Send SIGTERM to `pid`; returns success. Default: unsupported.
+    fn kill(&self, _pid: i64) -> bool {
+        false
+    }
 }
 
 /// A parsed command line.
@@ -555,6 +559,7 @@ where
             "seq" => self.cmd_seq(&args),
             "env" => self.cmd_env(&args),
             "sleep" => self.cmd_sleep(&args),
+            "kill" => self.cmd_kill(&args),
             "mem" => self.cmd_mem(),
             "ps" => self.cmd_ps(),
             "time" | "uptime" => self.emit(&format_u64(self.sys.uptime())),
@@ -602,6 +607,7 @@ where
             "  seq [a [b]] <end>   print number sequence",
             "  env              list environment variables",
             "  sleep <secs>     pause execution",
+            "  kill [-9] <pid>  terminate a process",
             "  true/:/false    no-op / fail (for && and ||)",
             "  clear           clear the screen",
             "  mem             memory usage",
@@ -1120,6 +1126,30 @@ where
         }
     }
 
+    fn cmd_kill(&mut self, args: &[String]) {
+        // Accept optional signal flag (-9, -KILL, -TERM, -15) then pid.
+        let mut pid_arg: Option<&String> = None;
+        for a in args {
+            if a.starts_with('-') {
+                continue; // signal selection not yet plumbed to System::kill
+            }
+            pid_arg = Some(a);
+            break;
+        }
+        let Some(p) = pid_arg else {
+            self.emit("kill: missing pid");
+            self.last_ok = false;
+            return;
+        };
+        match p.parse::<i64>() {
+            Ok(pid) if self.sys.kill(pid) => {}
+            _ => {
+                self.last_ok = false;
+                self.emit(&format!("kill: {}: no such process", p));
+            }
+        }
+    }
+
     fn cmd_unset(&mut self, args: &[String]) {
         for a in args {
             self.env.retain(|(k, _)| k != a);
@@ -1298,6 +1328,7 @@ mod tests {
 
     struct TestSys {
         launched: Rc<RefCell<Vec<String>>>,
+        killed: Rc<RefCell<Vec<i64>>>,
     }
     impl System for TestSys {
         fn reboot(&self) {}
@@ -1307,6 +1338,10 @@ mod tests {
         }
         fn uptime(&self) -> u64 {
             3600
+        }
+        fn kill(&self, pid: i64) -> bool {
+            self.killed.borrow_mut().push(pid);
+            true
         }
     }
 
@@ -1319,6 +1354,7 @@ mod tests {
     ) {
         let out = Rc::new(RefCell::new(String::new()));
         let launched = Rc::new(RefCell::new(Vec::new()));
+        let killed = Rc::new(RefCell::new(Vec::new()));
         let sh = Shell::new(
             TestIo {
                 input: lines.iter().map(|s| s.to_string()).collect(),
@@ -1327,7 +1363,7 @@ mod tests {
             TestFs::default(),
             TestProcs,
             TestMem,
-            TestSys { launched },
+            TestSys { launched, killed },
         );
         (sh, out)
     }
@@ -1573,6 +1609,13 @@ mod tests {
         assert!(o.contains("/etc"));
         assert!(o.contains("1\n2\n3"));
         assert!(o.contains("1\n3\n5"));
+    }
+
+    #[test]
+    fn kill_sends_signal() {
+        let (mut sh, _out) = shell(&["kill 42", "kill -9 7", "kill", "exit"]);
+        sh.run();
+        assert_eq!(sh.sys.killed.borrow().as_slice(), &[42, 7]);
     }
 
     #[test]
