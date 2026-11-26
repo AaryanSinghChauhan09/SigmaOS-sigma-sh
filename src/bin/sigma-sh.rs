@@ -142,7 +142,7 @@ impl System for StdSys {
         let _ = Proc::new("systemctl").arg("reboot").status();
         let _ = Proc::new("reboot").status();
     }
-    fn launch(&self, path: &str, args: &[String]) -> Result<i64, String> {
+    fn launch(&self, path: &str, args: &[String], env: &[String]) -> Result<i64, String> {
         let p = if Path::new(path).is_absolute() {
             path.to_string()
         } else {
@@ -150,6 +150,7 @@ impl System for StdSys {
         };
         let child = Proc::new(&p)
             .args(args)
+            .envs(env.iter().filter_map(|e| e.split_once('=')))
             .spawn()
             .map_err(|e| format!("{}: {}", p, e))?;
         Ok(child.id() as i64)

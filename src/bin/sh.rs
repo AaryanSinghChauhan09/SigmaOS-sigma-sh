@@ -193,9 +193,10 @@ impl System for SysSystem {
         let _ = sys::api::print("sh: reboot: no kernel reboot syscall\n");
     }
 
-    fn launch(&self, path: &str, args: &[String]) -> Result<i64, String> {
+    fn launch(&self, path: &str, args: &[String], env: &[String]) -> Result<i64, String> {
         let arg_refs: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
-        sys::api::spawn_args(path.as_bytes(), &arg_refs)
+        let env_refs: Vec<&[u8]> = env.iter().map(|e| e.as_bytes()).collect();
+        sys::api::spawn_args(path.as_bytes(), &arg_refs, &env_refs)
             .map(|pid| pid as i64)
             .map_err(|e| format!("spawn failed ({})", e))
     }

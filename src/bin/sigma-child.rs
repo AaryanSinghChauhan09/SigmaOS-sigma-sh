@@ -87,6 +87,25 @@ fn main_inner(argc: u64, argv: *const *const u8) -> ! {
                 let _ = sys::api::print(&alloc::format!(" arg{}={}", i, s));
             }
         }
+        // envp follows argv's NULL terminator
+        let envp = unsafe { argv.add(argc as usize + 1) };
+        let mut j = 0usize;
+        loop {
+            let p = unsafe { *envp.add(j) };
+            if p.is_null() {
+                break;
+            }
+            let mut s = alloc::string::String::new();
+            unsafe {
+                let mut q = p;
+                while *q != 0 && s.len() < 64 {
+                    s.push(*q as char);
+                    q = q.add(1);
+                }
+            }
+            let _ = sys::api::print(&alloc::format!(" env{}={}", j, s));
+            j += 1;
+        }
     }
     let _ = sys::api::print("\n");
     // Spin for a while so the timer IRQ preempts us and the parent

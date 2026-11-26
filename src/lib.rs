@@ -72,7 +72,7 @@ pub trait System {
     /// Reboot the machine.
     fn reboot(&self);
     /// Spawn a program; returns pid or error string.
-    fn launch(&self, path: &str, args: &[String]) -> Result<i64, String>;
+    fn launch(&self, path: &str, args: &[String], env: &[String]) -> Result<i64, String>;
     /// Wait for `pid` to exit; returns its exit status.
     /// Default: unsupported.
     fn wait(&self, _pid: i64) -> Result<i64, String> {
@@ -1301,7 +1301,12 @@ where
                 .unwrap_or_else(|| prog.clone());
             resolved.as_str()
         };
-        match self.sys.launch(prog, &args[1..]) {
+        let envp: alloc::vec::Vec<String> = self
+            .env
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect();
+        match self.sys.launch(prog, &args[1..], &envp) {
             Ok(pid) => {
                 self.last_pid = Some(pid);
                 self.emit(&format!("launched {} (pid {})", prog, pid));
@@ -1478,7 +1483,7 @@ mod tests {
     }
     impl System for TestSys {
         fn reboot(&self) {}
-        fn launch(&self, path: &str, _args: &[String]) -> Result<i64, String> {
+        fn launch(&self, path: &str, _args: &[String], _env: &[String]) -> Result<i64, String> {
             self.launched.borrow_mut().push(path.to_string());
             Ok(100)
         }
