@@ -1,6 +1,6 @@
 //! SigmaOS sigma-sh — minimal rescue shell.
 //!
-//! Builtins: help, ls, pwd, cd, echo, cat, which, mem, ps, time, launch, reboot,
+//! Builtins: help, ls, pwd, cd, echo, cat, which, history, mem, ps, time, launch, reboot,
 //! exit. I/O and filesystem access go through traits so the shell is
 //! fully testable on host and pluggable to sigma-sys at runtime.
 
@@ -161,6 +161,7 @@ pub struct Shell<I, F, P, M, S> {
     pub sys: S,
     pub cwd: String,
     pub oldpwd: Option<String>,
+    pub history: Vec<String>,
     pub running: bool,
 }
 
@@ -182,6 +183,7 @@ where
             sys,
             cwd: "/".into(),
             oldpwd: None,
+            history: Vec::new(),
             running: true,
         }
     }
@@ -197,6 +199,10 @@ where
             let Some(line) = self.io.read_line() else {
                 break;
             };
+            if self.history.len() >= 100 {
+                self.history.remove(0);
+            }
+            self.history.push(line.clone());
             self.execute(&line);
         }
     }
@@ -232,6 +238,7 @@ where
             "ls" => self.cmd_ls(&cmd.args),
             "cat" => self.cmd_cat(&cmd.args),
             "which" => self.cmd_which(&cmd.args),
+            "history" => self.cmd_history(),
             "mem" => self.cmd_mem(),
             "ps" => self.cmd_ps(),
             "time" | "uptime" => self.io.writeln(&format_u64(self.sys.uptime())),
@@ -273,6 +280,7 @@ where
             "ls" => self.cmd_ls(&cmd.args),
             "cat" => self.cmd_cat(&cmd.args),
             "which" => self.cmd_which(&cmd.args),
+            "history" => self.cmd_history(),
             "mem" => self.cmd_mem(),
             "ps" => self.cmd_ps(),
             "time" | "uptime" => self.io.writeln(&format_u64(self.sys.uptime())),
@@ -297,6 +305,7 @@ where
             "  echo <text>     print text",
             "  cat <file>      print file",
             "  which <prog>    locate a program on PATH",
+            "  history         list command history",
             "  mem             memory usage",
             "  ps              process list",
             "  time            uptime seconds",
@@ -434,6 +443,12 @@ where
             }
         }
         self.io.writeln(&format!("which: no {} in PATH", name));
+    }
+
+    fn cmd_history(&mut self) {
+        for (i, h) in self.history.iter().enumerate() {
+            self.io.writeln(&format!("{:4}  {}", i + 1, h));
+        }
     }
 
     fn cmd_mem(&mut self) {
@@ -667,6 +682,15 @@ mod tests {
         assert!(o.contains("one"));
         assert!(o.contains("two"));
         assert!(o.contains("a;b"));
+    }
+
+    #[test]
+    fn history_lists_commands() {
+        let (mut sh, out) = shell(&["echo hi", "pwd", "history", "exit"]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("echo hi"));
+        assert!(o.contains("pwd"));
     }
 
     #[test]
