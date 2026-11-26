@@ -176,6 +176,9 @@ impl System for StdSys {
             .map(|s| s.success())
             .unwrap_or(false)
     }
+    fn uname(&self) -> &'static str {
+        std::env::consts::OS
+    }
 }
 
 fn main() {

@@ -81,6 +81,10 @@ pub trait System {
     fn kill(&self, _pid: i64) -> bool {
         false
     }
+    /// Kernel/OS name for `uname`. Default: sigmaos.
+    fn uname(&self) -> &'static str {
+        "sigmaos"
+    }
 }
 
 /// A parsed command line.
@@ -599,6 +603,7 @@ where
             "env" => self.cmd_env(&args),
             "sleep" => self.cmd_sleep(&args),
             "kill" => self.cmd_kill(&args),
+            "uname" => self.emit(self.sys.uname()),
             "mem" => self.cmd_mem(),
             "ps" => self.cmd_ps(),
             "time" | "uptime" => self.emit(&format_u64(self.sys.uptime())),
@@ -648,6 +653,7 @@ where
             "  env              list environment variables",
             "  sleep <secs>     pause execution",
             "  kill [-9] <pid>  terminate a process",
+            "  uname            print OS name",
             "  true/:/false    no-op / fail (for && and ||)",
             "  clear           clear the screen",
             "  mem             memory usage",
@@ -1716,6 +1722,13 @@ mod tests {
         let o = out.borrow();
         assert!(o.contains("l2\n"), "{}", o);
         assert!(o.contains("3 3 9"), "{}", o);
+    }
+
+    #[test]
+    fn uname_prints_os_name() {
+        let (mut sh, out) = shell(&["uname", "exit"]);
+        sh.run();
+        assert!(out.borrow().contains("sigmaos"));
     }
 
     #[test]
