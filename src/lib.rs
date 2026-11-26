@@ -73,6 +73,11 @@ pub trait System {
     fn reboot(&self);
     /// Spawn a program; returns pid or error string.
     fn launch(&self, path: &str, args: &[String]) -> Result<i64, String>;
+    /// Wait for `pid` to exit; returns its exit status.
+    /// Default: unsupported.
+    fn wait(&self, _pid: i64) -> Result<i64, String> {
+        Err("wait: unsupported".into())
+    }
     /// Current uptime seconds.
     fn uptime(&self) -> u64;
     /// Sleep for `secs` seconds. Default: no-op.
@@ -281,6 +286,8 @@ pub struct Shell<I, F, P, M, S> {
     pub capture: Option<String>,
     /// Text fed to the current command's stdin by the previous pipeline stage.
     pub pending_stdin: Option<String>,
+    /// Pid of the most recently launched program (for bare `wait`).
+    pub last_pid: Option<i64>,
     pub running: bool,
 }
 
@@ -309,6 +316,7 @@ where
             redirect_initialized: false,
             capture: None,
             pending_stdin: None,
+            last_pid: None,
             running: true,
         }
     }
@@ -609,6 +617,7 @@ where
             "ps" => self.cmd_ps(),
             "time" | "uptime" => self.emit(&format_u64(self.sys.uptime())),
             "launch" | "run" => self.cmd_launch(&args),
+            "wait" => self.cmd_wait(&args),
             "reboot" => self.sys.reboot(),
             "jobs" => self.cmd_jobs(),
             "fg" => self.cmd_fg(&args),
@@ -661,6 +670,7 @@ where
             "  ps              process list",
             "  time            uptime seconds",
             "  launch <prog>   run a program",
+            "  wait [pid]      wait for a child to exit",
             "  jobs            list background jobs",
             "  fg <job>        bring job to foreground",
             "  bg <job>        send job to background",
@@ -1292,8 +1302,43 @@ where
             resolved.as_str()
         };
         match self.sys.launch(prog, &args[1..]) {
-            Ok(pid) => self.emit(&format!("launched {} (pid {})", prog, pid)),
+            Ok(pid) => {
+                self.last_pid = Some(pid);
+                self.emit(&format!("launched {} (pid {})", prog, pid));
+            }
             Err(e) => self.emit(&format!("launch: {}: {}", prog, e)),
+        }
+    }
+
+    /// `wait [pid]` — block until a child exits; bare `wait` uses the
+    /// most recently launched pid.
+    fn cmd_wait(&mut self, args: &[String]) {
+        let pid = match args.first() {
+            Some(s) => match s.parse::<i64>() {
+                Ok(p) => p,
+                Err(_) => {
+                    self.emit(&format!("wait: invalid pid '{}'", s));
+                    self.last_ok = false;
+                    return;
+                }
+            },
+            None => match self.last_pid {
+                Some(p) => p,
+                None => {
+                    self.emit("wait: no child process");
+                    self.last_ok = false;
+                    return;
+                }
+            },
+        };
+        match self.sys.wait(pid) {
+            Ok(status) => {
+                self.emit(&format!("wait: pid {} exited {}", pid, status));
+            }
+            Err(e) => {
+                self.emit(&format!("wait: {}: {}", pid, e));
+                self.last_ok = false;
+            }
         }
     }
 
@@ -1444,6 +1489,9 @@ mod tests {
             self.killed.borrow_mut().push((pid, sig.to_string()));
             true
         }
+        fn wait(&self, _pid: i64) -> Result<i64, String> {
+            Ok(0)
+        }
     }
 
     #[allow(clippy::type_complexity)]
@@ -1515,6 +1563,15 @@ mod tests {
         let (mut sh, out) = shell(&["launch /bin/sh arg1", "exit"]);
         sh.run();
         assert!(out.borrow().contains("pid 100"));
+    }
+
+    #[test]
+    fn wait_uses_last_pid_and_reports_status() {
+        let (mut sh, out) = shell(&["launch /bin/sh", "wait", "wait 7", "exit"]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("wait: pid 100 exited 0"));
+        assert!(o.contains("wait: pid 7 exited 0"));
     }
 
     #[test]

@@ -200,6 +200,10 @@ impl System for SysSystem {
             .map_err(|e| format!("spawn failed ({})", e))
     }
 
+    fn wait(&self, pid: i64) -> Result<i64, String> {
+        sys::api::wait(pid as u64).map_err(|e| format!("wait failed ({})", e))
+    }
+
     fn uptime(&self) -> u64 {
         tsc() / TSC_HZ
     }
