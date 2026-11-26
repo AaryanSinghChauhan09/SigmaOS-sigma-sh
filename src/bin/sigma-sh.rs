@@ -166,6 +166,9 @@ impl System for StdSys {
             .map(|d| d.as_secs())
             .unwrap_or(0)
     }
+    fn sleep(&self, secs: u64) {
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+    }
 }
 
 fn main() {

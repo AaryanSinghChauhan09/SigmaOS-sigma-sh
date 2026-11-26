@@ -75,6 +75,8 @@ pub trait System {
     fn launch(&self, path: &str, args: &[String]) -> Result<i64, String>;
     /// Current uptime seconds.
     fn uptime(&self) -> u64;
+    /// Sleep for `secs` seconds. Default: no-op.
+    fn sleep(&self, _secs: u64) {}
 }
 
 /// A parsed command line.
@@ -516,7 +518,7 @@ where
             self.redirect = Some(r);
             self.redirect_initialized = false;
         }
-        self.last_ok = is_builtin(&cmd.name);
+        self.last_ok = true;
         match cmd.name.as_str() {
             "help" | "?" => self.cmd_help(),
             "exit" | "logout" | "quit" => self.running = false,
@@ -551,6 +553,8 @@ where
             "basename" => self.cmd_basename(&args),
             "dirname" => self.cmd_dirname(&args),
             "seq" => self.cmd_seq(&args),
+            "env" => self.cmd_env(&args),
+            "sleep" => self.cmd_sleep(&args),
             "mem" => self.cmd_mem(),
             "ps" => self.cmd_ps(),
             "time" | "uptime" => self.emit(&format_u64(self.sys.uptime())),
@@ -559,10 +563,10 @@ where
             "jobs" => self.cmd_jobs(),
             "fg" => self.cmd_fg(&args),
             "bg" => self.cmd_bg(&args),
-            _ => self.emit(&format!("sigma-sh: {}: command not found", cmd.name)),
-        }
-        if is_builtin(&cmd.name) && cmd.name != "false" {
-            self.last_ok = true;
+            _ => {
+                self.last_ok = false;
+                self.emit(&format!("sigma-sh: {}: command not found", cmd.name));
+            }
         }
         self.redirect = prev_redir;
     }
@@ -596,6 +600,8 @@ where
             "  basename <path> [suf]  last path component",
             "  dirname <path>      parent directory",
             "  seq [a [b]] <end>   print number sequence",
+            "  env              list environment variables",
+            "  sleep <secs>     pause execution",
             "  true/:/false    no-op / fail (for && and ||)",
             "  clear           clear the screen",
             "  mem             memory usage",
@@ -651,7 +657,10 @@ where
                     self.emit(&norm);
                 }
             }
-            None => self.emit(&format!("cd: {}: no such directory", target)),
+            None => {
+                self.last_ok = false;
+                self.emit(&format!("cd: {}: no such directory", target));
+            }
         }
     }
 
@@ -663,7 +672,10 @@ where
                     self.emit(&n);
                 }
             }
-            None => self.emit(&format!("ls: {}: no such directory", path)),
+            None => {
+                self.last_ok = false;
+                self.emit(&format!("ls: {}: no such directory", path));
+            }
         }
     }
 
@@ -675,7 +687,10 @@ where
         let path = self.resolve(Some(a));
         match self.fs.read_to_string(&path) {
             Some(s) => self.emit_raw(&s),
-            None => self.emit(&format!("cat: {}: no such file", path)),
+            None => {
+                self.last_ok = false;
+                self.emit(&format!("cat: {}: no such file", path));
+            }
         }
     }
 
@@ -703,6 +718,7 @@ where
             if found {
                 self.emit(&path);
             } else {
+                self.last_ok = false;
                 self.emit(&format!("which: no {} in {}", name, path));
             }
             return;
@@ -715,6 +731,7 @@ where
                 }
             }
         }
+        self.last_ok = false;
         self.emit(&format!("which: no {} in PATH", name));
     }
 
@@ -1069,6 +1086,40 @@ where
         }
     }
 
+    fn cmd_env(&mut self, args: &[String]) {
+        if let Some(name) = args.first() {
+            let val = self
+                .env
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone());
+            match val {
+                Some(v) => self.emit(&v),
+                None => self.last_ok = false,
+            }
+            return;
+        }
+        let lines: Vec<String> = self
+            .env
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect();
+        for l in lines {
+            self.emit(&l);
+        }
+    }
+
+    fn cmd_sleep(&mut self, args: &[String]) {
+        let Some(a) = args.first() else {
+            self.emit("sleep: missing seconds");
+            return;
+        };
+        match a.parse::<u64>() {
+            Ok(secs) => self.sys.sleep(secs),
+            Err(_) => self.emit(&format!("sleep: {}: invalid interval", a)),
+        }
+    }
+
     fn cmd_unset(&mut self, args: &[String]) {
         for a in args {
             self.env.retain(|(k, _)| k != a);
@@ -1158,57 +1209,6 @@ fn glob_match(pat: &str, name: &str) -> bool {
         }
     }
     true
-}
-
-/// Names dispatched by the shell (used for `&&` success tracking).
-fn is_builtin(name: &str) -> bool {
-    matches!(
-        name,
-        "help"
-            | "?"
-            | "exit"
-            | "logout"
-            | "quit"
-            | "true"
-            | ":"
-            | "false"
-            | "clear"
-            | "echo"
-            | "pwd"
-            | "cd"
-            | "ls"
-            | "cat"
-            | "which"
-            | "history"
-            | "export"
-            | "unset"
-            | "mkdir"
-            | "rmdir"
-            | "rm"
-            | "touch"
-            | "cp"
-            | "mv"
-            | "head"
-            | "tail"
-            | "wc"
-            | "grep"
-            | "sort"
-            | "uniq"
-            | "find"
-            | "basename"
-            | "dirname"
-            | "seq"
-            | "mem"
-            | "ps"
-            | "time"
-            | "uptime"
-            | "launch"
-            | "run"
-            | "reboot"
-            | "jobs"
-            | "fg"
-            | "bg"
-    )
 }
 
 fn format_u64(v: u64) -> String {
@@ -1573,6 +1573,24 @@ mod tests {
         assert!(o.contains("/etc"));
         assert!(o.contains("1\n2\n3"));
         assert!(o.contains("1\n3\n5"));
+    }
+
+    #[test]
+    fn env_and_sleep() {
+        let (mut sh, out) = shell(&[
+            "export EDITOR=vim",
+            "env EDITOR",
+            "env",
+            "env MISSING && echo nope || echo envfail-ok",
+            "sleep 0",
+            "exit",
+        ]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("vim"));
+        assert!(o.contains("EDITOR=vim"));
+        assert!(o.contains("envfail-ok"));
+        assert!(!o.contains("nope"));
     }
 
     #[test]
