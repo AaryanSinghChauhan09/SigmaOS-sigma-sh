@@ -149,7 +149,11 @@ impl ProcTable for SysProcs {
 struct SysMem;
 impl MemInfo for SysMem {
     fn memory_kb(&self) -> (u64, u64) {
-        (0, 0)
+        // MEMINFO returns 4 KiB frames; convert to KiB.
+        match sys::api::meminfo() {
+            Ok((total, free)) => (total * 4, free * 4),
+            Err(_) => (0, 0),
+        }
     }
 }
 
