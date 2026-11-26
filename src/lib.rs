@@ -1146,6 +1146,8 @@ where
             "tr" => self.cmd_tr(&args),
             "cut" => self.cmd_cut(&args),
             "nl" => self.cmd_nl(&args),
+            "xargs" => self.cmd_xargs(&args),
+            "paste" => self.cmd_paste(&args),
             "tee" => self.cmd_tee(&args),
             "env" => self.cmd_env(&args),
             "sleep" => self.cmd_sleep(&args),
@@ -1244,6 +1246,8 @@ where
             "  tr [-d] S1 [S2]    translate/delete chars (a-z ranges)",
             "  cut -dD -fLIST|-cLIST [file]  select fields/chars",
             "  nl [file]         number lines",
+            "  xargs [-I S] [-n N] CMD  run CMD per stdin line",
+            "  paste [-dC] <file>...  join lines of files with a delim",
             "  tee [-a] <file>   copy stdin to file(s) and stdout",
             "  env              list environment variables",
             "  sleep <secs>     pause execution",
@@ -1888,7 +1892,7 @@ where
                 _ => out.push(c),
             }
         }
-        self.io.write(&out);
+        self.emit_raw(&out);
     }
 
     /// `test EXPR` / `[ EXPR ]` — file tests (-e -f -d -s), string
@@ -2066,6 +2070,111 @@ where
         };
         for (i, line) in data.lines().enumerate() {
             self.emit(&format!("{:6}\t{}", i + 1, line));
+        }
+    }
+
+    /// `xargs [-I STR] [-n N] CMD [ARGS...]` — run CMD once per
+    /// stdin line (or per group of N lines with -n), appending the
+    /// line(s) as arguments. `-I STR` replaces STR inside the fixed
+    /// args with each line instead.
+    fn cmd_xargs(&mut self, args: &[String]) {
+        let mut repl: Option<String> = None;
+        let mut per_line = 1usize;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "-I" if i + 1 < args.len() => {
+                    repl = Some(args[i + 1].clone());
+                    i += 2;
+                }
+                "-n" if i + 1 < args.len() => {
+                    per_line = args[i + 1].parse().unwrap_or(1).max(1);
+                    i += 2;
+                }
+                a if a.starts_with("-I") && a.len() > 2 => {
+                    repl = Some(a[2..].to_string());
+                    i += 1;
+                }
+                a if a.starts_with("-n") && a.len() > 2 => {
+                    per_line = a[2..].parse().unwrap_or(1).max(1);
+                    i += 1;
+                }
+                _ => break,
+            }
+        }
+        let fixed = &args[i..];
+        if fixed.is_empty() {
+            self.emit("xargs: usage: xargs [-I STR] [-n N] CMD [ARGS...]");
+            return;
+        }
+        let data = self.pending_stdin.take().unwrap_or_default();
+        let lines: Vec<&str> = data.lines().filter(|l| !l.is_empty()).collect();
+        for chunk in lines.chunks(per_line) {
+            let mut cargs: Vec<String> = Vec::new();
+            if let Some(r) = &repl {
+                for a in fixed {
+                    cargs.push(a.replace(r, &chunk.join(" ")));
+                }
+            } else {
+                cargs.extend(fixed.iter().cloned());
+                cargs.extend(chunk.iter().map(|s| s.to_string()));
+            }
+            let n = cargs.len();
+            let cmd = Command {
+                name: cargs[0].clone(),
+                args: cargs[1..].to_vec(),
+                quoted: alloc::vec![0; n - 1],
+            };
+            self.execute_single_command(&cmd);
+            if !self.running {
+                break;
+            }
+        }
+    }
+
+    /// `paste [-d DELIM] FILE...` — join line i of each input with
+    /// DELIM (default tab). One file or stdin when none given.
+    fn cmd_paste(&mut self, args: &[String]) {
+        let mut delim = '\t';
+        let mut files: Vec<&String> = Vec::new();
+        let mut i = 0;
+        while i < args.len() {
+            if args[i] == "-d" && i + 1 < args.len() {
+                delim = args[i + 1].chars().next().unwrap_or('\t');
+                i += 2;
+            } else if let Some(rest) = args[i].strip_prefix("-d") {
+                if !rest.is_empty() {
+                    delim = rest.chars().next().unwrap_or('\t');
+                }
+                i += 1;
+            } else {
+                files.push(&args[i]);
+                i += 1;
+            }
+        }
+        let mut cols: Vec<Vec<String>> = Vec::new();
+        if files.is_empty() {
+            let data = self.pending_stdin.take().unwrap_or_default();
+            cols.push(data.lines().map(|s| s.to_string()).collect());
+        } else {
+            for f in &files {
+                let path = self.resolve(Some(f));
+                match self.fs.read_to_string(&path) {
+                    Some(d) => cols.push(d.lines().map(|s| s.to_string()).collect()),
+                    None => {
+                        self.emit(&format!("paste: {}: no such file", path));
+                        return;
+                    }
+                }
+            }
+        }
+        let rows = cols.iter().map(|c| c.len()).max().unwrap_or(0);
+        for r in 0..rows {
+            let line: Vec<&str> = cols
+                .iter()
+                .map(|c| c.get(r).map(String::as_str).unwrap_or(""))
+                .collect();
+            self.emit(&line.join(&delim.to_string()));
         }
     }
 
@@ -3165,5 +3274,52 @@ mod tests {
         // via a second command reading one back is not possible in TestFs,
         // so assert output went to stdout at minimum).
         let _ = out;
+    }
+
+    #[test]
+    fn xargs_runs_per_line() {
+        let (mut sh, out) = shell(&["printf 'a\\nb\\n' | xargs echo item", "exit"]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("item a"), "OUT: {o}");
+        assert!(o.contains("item b"), "OUT: {o}");
+    }
+
+    #[test]
+    fn xargs_dash_i_and_dash_n() {
+        let (mut sh, out) = shell(&[
+            "printf 'a\\nb\\n' | xargs -I{} echo got-{}",
+            "printf 'a\\nb\\n' | xargs -n 2 echo pair",
+            "exit",
+        ]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("got-a"));
+        assert!(o.contains("got-b"));
+        assert!(o.contains("pair a b"));
+    }
+
+    #[test]
+    fn paste_joins_files() {
+        let (mut sh, out) = shell(&[
+            "paste /tmp/multi /tmp/dups",
+            "paste -d: /tmp/multi /tmp/dups",
+            "exit",
+        ]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("l1\tb"));
+        assert!(o.contains("l2\ta"));
+        assert!(o.contains("l3\ta"));
+        assert!(o.contains("l1:b"));
+    }
+
+    #[test]
+    fn paste_stdin_single_col() {
+        let (mut sh, out) = shell(&["printf 'x\\ny\\n' | paste", "exit"]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("x\n"));
+        assert!(o.contains("y\n"));
     }
 }
