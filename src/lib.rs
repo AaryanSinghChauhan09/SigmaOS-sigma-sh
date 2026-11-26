@@ -539,6 +539,11 @@ where
             "rmdir" => self.cmd_rmdir(&args),
             "rm" => self.cmd_rm(&args),
             "touch" => self.cmd_touch(&args),
+            "cp" => self.cmd_cp(&args, false),
+            "mv" => self.cmd_cp(&args, true),
+            "head" => self.cmd_head_tail(&args, true),
+            "tail" => self.cmd_head_tail(&args, false),
+            "wc" => self.cmd_wc(&args),
             "mem" => self.cmd_mem(),
             "ps" => self.cmd_ps(),
             "time" | "uptime" => self.emit(&format_u64(self.sys.uptime())),
@@ -572,6 +577,11 @@ where
             "  rmdir <dir>     remove an empty directory",
             "  rm <file>       remove a file",
             "  touch <file>    create an empty file",
+            "  cp <src> <dst>  copy a file",
+            "  mv <src> <dst>  move a file",
+            "  head [-n N] <f> print first N lines (default 10)",
+            "  tail [-n N] <f> print last N lines",
+            "  wc <file>       count lines, words, bytes",
             "  true/:/false    no-op / fail (for && and ||)",
             "  clear           clear the screen",
             "  mem             memory usage",
@@ -791,6 +801,86 @@ where
         }
     }
 
+    fn cmd_cp(&mut self, args: &[String], move_: bool) {
+        let name = if move_ { "mv" } else { "cp" };
+        let Some(src) = args.first() else {
+            self.emit(&format!("{}: missing source", name));
+            return;
+        };
+        let Some(dst) = args.get(1) else {
+            self.emit(&format!("{}: missing destination", name));
+            return;
+        };
+        let src_path = self.resolve(Some(src));
+        let dst_path = self.resolve(Some(dst));
+        match self.fs.read_to_string(&src_path) {
+            Some(data) => {
+                if self.fs.write_file(&dst_path, &data, false) {
+                    if move_ {
+                        let _ = self.fs.remove_path(&src_path);
+                    }
+                } else {
+                    self.emit(&format!("{}: cannot write {}", name, dst_path));
+                }
+            }
+            None => self.emit(&format!("{}: {}: no such file", name, src_path)),
+        }
+    }
+
+    /// `head`/`tail`: `-n N` line count (default 10), then file.
+    fn cmd_head_tail(&mut self, args: &[String], head: bool) {
+        let name = if head { "head" } else { "tail" };
+        let mut n = 10usize;
+        let mut file: Option<&String> = None;
+        let mut i = 0;
+        while i < args.len() {
+            if args[i] == "-n" && i + 1 < args.len() {
+                n = args[i + 1].parse().unwrap_or(10);
+                i += 2;
+            } else if file.is_none() {
+                file = Some(&args[i]);
+                i += 1;
+            } else {
+                i += 1;
+            }
+        }
+        let Some(f) = file else {
+            self.emit(&format!("{}: missing file", name));
+            return;
+        };
+        let path = self.resolve(Some(f));
+        let Some(data) = self.fs.read_to_string(&path) else {
+            self.emit(&format!("{}: {}: no such file", name, path));
+            return;
+        };
+        let lines: Vec<&str> = data.lines().collect();
+        let selected: Vec<&str> = if head {
+            lines.iter().take(n).copied().collect()
+        } else {
+            let start = lines.len().saturating_sub(n);
+            lines.iter().skip(start).copied().collect()
+        };
+        for l in selected {
+            self.emit(l);
+        }
+    }
+
+    fn cmd_wc(&mut self, args: &[String]) {
+        let Some(f) = args.first() else {
+            self.emit("wc: missing file");
+            return;
+        };
+        let path = self.resolve(Some(f));
+        let Some(data) = self.fs.read_to_string(&path) else {
+            self.emit(&format!("wc: {}: no such file", path));
+            return;
+        };
+        let lines = data.lines().count();
+        let words = data.split_whitespace().count();
+        let bytes = data.len();
+        self.emit(&format!("{} {} {} {}", lines, words, bytes, path));
+    }
+
     fn cmd_unset(&mut self, args: &[String]) {
         for a in args {
             self.env.retain(|(k, _)| k != a);
@@ -908,6 +998,11 @@ fn is_builtin(name: &str) -> bool {
             | "rmdir"
             | "rm"
             | "touch"
+            | "cp"
+            | "mv"
+            | "head"
+            | "tail"
+            | "wc"
             | "mem"
             | "ps"
             | "time"
@@ -968,6 +1063,7 @@ mod tests {
         fn read_to_string(&self, path: &str) -> Option<String> {
             match path {
                 "/etc/hostname" => Some("sigmaos\n".to_string()),
+                "/tmp/multi" => Some("l1\nl2\nl3\n".to_string()),
                 _ => None,
             }
         }
@@ -1224,6 +1320,33 @@ mod tests {
             sh.fs.removed.borrow().as_slice(),
             &["/tmp/newfile".to_string(), "/tmp/dir".to_string()]
         );
+    }
+
+    #[test]
+    fn file_utils_work() {
+        let (mut sh, out) = shell(&[
+            "cp /etc/hostname /tmp/copy",
+            "mv /etc/hostname /tmp/moved",
+            "head -n 2 /tmp/multi",
+            "tail -n 1 /tmp/multi",
+            "wc /tmp/multi",
+            "exit",
+        ]);
+        sh.run();
+        let writes = sh.fs.writes.borrow();
+        assert!(writes.contains(&("/tmp/copy".to_string(), "sigmaos\n".to_string(), false)));
+        assert!(writes.contains(&("/tmp/moved".to_string(), "sigmaos\n".to_string(), false)));
+        drop(writes);
+        assert!(sh
+            .fs
+            .removed
+            .borrow()
+            .contains(&"/etc/hostname".to_string()));
+        let o = out.borrow();
+        assert!(o.contains("l1"));
+        assert!(o.contains("l2"));
+        assert!(o.contains("l3"));
+        assert!(o.contains("3 3 9 /tmp/multi"));
     }
 
     #[test]
