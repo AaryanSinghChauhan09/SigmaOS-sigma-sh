@@ -544,6 +544,7 @@ where
             "head" => self.cmd_head_tail(&args, true),
             "tail" => self.cmd_head_tail(&args, false),
             "wc" => self.cmd_wc(&args),
+            "grep" => self.cmd_grep(&args),
             "mem" => self.cmd_mem(),
             "ps" => self.cmd_ps(),
             "time" | "uptime" => self.emit(&format_u64(self.sys.uptime())),
@@ -582,6 +583,7 @@ where
             "  head [-n N] <f> print first N lines (default 10)",
             "  tail [-n N] <f> print last N lines",
             "  wc <file>       count lines, words, bytes",
+            "  grep [-ivnc] <pat> <file>  search file contents",
             "  true/:/false    no-op / fail (for && and ||)",
             "  clear           clear the screen",
             "  mem             memory usage",
@@ -881,6 +883,60 @@ where
         self.emit(&format!("{} {} {} {}", lines, words, bytes, path));
     }
 
+    /// `grep [-ivnc] PATTERN FILE` — substring match per line.
+    fn cmd_grep(&mut self, args: &[String]) {
+        let mut icase = false;
+        let mut invert = false;
+        let mut numbers = false;
+        let mut count_only = false;
+        let mut pos: Vec<&String> = Vec::new();
+        for a in args {
+            match a.as_str() {
+                "-i" => icase = true,
+                "-v" => invert = true,
+                "-n" => numbers = true,
+                "-c" => count_only = true,
+                _ => pos.push(a),
+            }
+        }
+        if pos.len() < 2 {
+            self.emit("grep: usage: grep [-ivnc] <pattern> <file>");
+            return;
+        }
+        let pat = if icase {
+            pos[0].to_lowercase()
+        } else {
+            pos[0].clone()
+        };
+        let path = self.resolve(Some(pos[1]));
+        let Some(data) = self.fs.read_to_string(&path) else {
+            self.emit(&format!("grep: {}: no such file", path));
+            return;
+        };
+        let mut hits = 0usize;
+        for (i, line) in data.lines().enumerate() {
+            let hay = if icase {
+                line.to_lowercase()
+            } else {
+                line.to_string()
+            };
+            let m = hay.contains(&pat) != invert;
+            if m {
+                hits += 1;
+                if !count_only {
+                    if numbers {
+                        self.emit(&format!("{}:{}", i + 1, line));
+                    } else {
+                        self.emit(line);
+                    }
+                }
+            }
+        }
+        if count_only {
+            self.emit(&hits.to_string());
+        }
+    }
+
     fn cmd_unset(&mut self, args: &[String]) {
         for a in args {
             self.env.retain(|(k, _)| k != a);
@@ -1003,6 +1059,7 @@ fn is_builtin(name: &str) -> bool {
             | "head"
             | "tail"
             | "wc"
+            | "grep"
             | "mem"
             | "ps"
             | "time"
@@ -1347,6 +1404,23 @@ mod tests {
         assert!(o.contains("l2"));
         assert!(o.contains("l3"));
         assert!(o.contains("3 3 9 /tmp/multi"));
+    }
+
+    #[test]
+    fn grep_searches() {
+        let (mut sh, out) = shell(&[
+            "grep l2 /tmp/multi",
+            "grep -n l2 /tmp/multi",
+            "grep -c l /tmp/multi",
+            "grep -v l1 /tmp/multi",
+            "grep -i L3 /tmp/multi",
+            "exit",
+        ]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("l2"));
+        assert!(o.contains("2:l2")); // -n line numbers
+        assert!(o.contains("l3")); // -v and -i both reach l3
     }
 
     #[test]
