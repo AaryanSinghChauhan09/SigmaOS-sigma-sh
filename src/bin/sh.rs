@@ -137,12 +137,32 @@ impl Fs for SysFs {
     }
 }
 
-// ── Process table / memory: no kernel backing yet ─────────────────────
+// ── Process table / memory: PROCINFO + MEMINFO syscalls ───────────────
 
 struct SysProcs;
 impl ProcTable for SysProcs {
     fn list(&self) -> Vec<String> {
-        Vec::new()
+        match sys::api::procinfo() {
+            Ok(slots) => slots
+                .iter()
+                .filter(|(pid, _, _)| *pid != 0)
+                .map(|(pid, flags, code)| {
+                    let state = if flags & 1 != 0 {
+                        if flags & 4 != 0 {
+                            "reaped".to_string()
+                        } else {
+                            format!("zombie({})", code)
+                        }
+                    } else if flags & 2 != 0 {
+                        "sleeping".to_string()
+                    } else {
+                        "running".to_string()
+                    };
+                    format!("{:>4} {}", pid, state)
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
     }
 }
 
