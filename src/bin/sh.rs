@@ -170,6 +170,10 @@ impl Fs for SysFs {
         sys::api::open(path, flags).ok()
     }
 
+    fn open_read(&self, path: &str) -> Option<i64> {
+        sys::api::open(path, 0).ok()
+    }
+
     fn cwd(&self) -> String {
         let mut buf = [0u8; 128];
         match sys::api::getcwd(&mut buf) {
@@ -241,6 +245,7 @@ impl System for SysSystem {
         args: &[String],
         env: &[String],
         stdout_fd: i64,
+        stdin_fd: i64,
     ) -> Result<i64, String> {
         let arg_refs: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
         let env_refs: Vec<&[u8]> = env.iter().map(|e| e.as_bytes()).collect();
@@ -249,6 +254,7 @@ impl System for SysSystem {
             &arg_refs,
             &env_refs,
             stdout_fd.max(0) as u64,
+            stdin_fd.max(0) as u64,
         )
         .map(|pid| pid as i64)
         .map_err(|e| format!("spawn failed ({})", e))

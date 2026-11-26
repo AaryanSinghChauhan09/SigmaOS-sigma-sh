@@ -60,6 +60,11 @@ pub trait Fs {
     fn open_write(&self, _path: &str, _append: bool) -> Option<i64> {
         None
     }
+    /// Open a file for reading; returns an fd usable as a child's
+    /// stdin redirect. Default: unsupported.
+    fn open_read(&self, _path: &str) -> Option<i64> {
+        None
+    }
     /// Change the process working directory. Default: unsupported.
     fn chdir(&self, _path: &str) -> bool {
         false
@@ -91,6 +96,7 @@ pub trait System {
         args: &[String],
         env: &[String],
         stdout_fd: i64,
+        stdin_fd: i64,
     ) -> Result<i64, String>;
     /// Wait for `pid` to exit; returns its exit status.
     /// Default: unsupported.
@@ -574,17 +580,30 @@ where
                 args.remove(i);
             }
         }
-        // `<` input redirection: feed the file as the command's stdin.
+        // `<` input redirection: for `launch` it becomes the child's
+        // stdin fd; for builtins it feeds pending_stdin as before.
+        let mut stdin_fd = 0i64;
         if let Some(i) = args.iter().position(|a| a == "<") {
             if i + 1 < args.len() {
                 let path = self.resolve(Some(&args[i + 1]));
                 args.drain(i..=i + 1);
-                match self.fs.read_to_string(&path) {
-                    Some(data) => self.pending_stdin = Some(data),
-                    None => {
-                        self.emit(&format!("{}: {}: no such file", cmd.name, path));
-                        self.last_ok = false;
-                        return;
+                if cmd.name == "launch" || cmd.name == "run" {
+                    match self.fs.open_read(&path) {
+                        Some(fd) => stdin_fd = fd,
+                        None => {
+                            self.emit(&format!("{}: {}: no such file", cmd.name, path));
+                            self.last_ok = false;
+                            return;
+                        }
+                    }
+                } else {
+                    match self.fs.read_to_string(&path) {
+                        Some(data) => self.pending_stdin = Some(data),
+                        None => {
+                            self.emit(&format!("{}: {}: no such file", cmd.name, path));
+                            self.last_ok = false;
+                            return;
+                        }
                     }
                 }
             } else {
@@ -663,7 +682,7 @@ where
                     // prev_redir is restored at the end of this fn.
                     self.redirect = None;
                 }
-                self.cmd_launch(&args, fd);
+                self.cmd_launch(&args, fd, stdin_fd);
             }
             "wait" => self.cmd_wait(&args),
             "reboot" => self.sys.reboot(),
@@ -1347,7 +1366,7 @@ where
         }
     }
 
-    fn cmd_launch(&mut self, args: &[String], stdout_fd: i64) {
+    fn cmd_launch(&mut self, args: &[String], stdout_fd: i64, stdin_fd: i64) {
         let Some(prog) = args.first() else {
             self.emit("launch: missing program");
             return;
@@ -1375,7 +1394,10 @@ where
             .iter()
             .map(|(k, v)| format!("{}={}", k, v))
             .collect();
-        match self.sys.launch(prog, &args[1..], &envp, stdout_fd) {
+        match self
+            .sys
+            .launch(prog, &args[1..], &envp, stdout_fd, stdin_fd)
+        {
             Ok(pid) => {
                 self.last_pid = Some(pid);
                 if self.jobs.len() < 32 {
@@ -1635,6 +1657,7 @@ mod tests {
             _args: &[String],
             _env: &[String],
             _stdout_fd: i64,
+            _stdin_fd: i64,
         ) -> Result<i64, String> {
             self.launched.borrow_mut().push(path.to_string());
             Ok(100)
