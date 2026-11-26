@@ -539,6 +539,23 @@ where
                 args.remove(i);
             }
         }
+        // `<` input redirection: feed the file as the command's stdin.
+        if let Some(i) = args.iter().position(|a| a == "<") {
+            if i + 1 < args.len() {
+                let path = self.resolve(Some(&args[i + 1]));
+                args.drain(i..=i + 1);
+                match self.fs.read_to_string(&path) {
+                    Some(data) => self.pending_stdin = Some(data),
+                    None => {
+                        self.emit(&format!("{}: {}: no such file", cmd.name, path));
+                        self.last_ok = false;
+                        return;
+                    }
+                }
+            } else {
+                args.remove(i);
+            }
+        }
         let prev_redir = self.redirect.take();
         if let Some(r) = redir {
             self.redirect = Some(r);
@@ -595,6 +612,7 @@ where
                 self.emit(&format!("sigma-sh: {}: command not found", cmd.name));
             }
         }
+        self.pending_stdin = None;
         self.redirect = prev_redir;
     }
 
@@ -1688,6 +1706,15 @@ mod tests {
         sh.run();
         let o = out.borrow();
         assert!(o.contains("2\n"), "{}", o);
+        assert!(o.contains("3 3 9"), "{}", o);
+    }
+
+    #[test]
+    fn input_redirect_feeds_stdin() {
+        let (mut sh, out) = shell(&["grep l2 < /tmp/multi", "wc < /tmp/multi", "exit"]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("l2\n"), "{}", o);
         assert!(o.contains("3 3 9"), "{}", o);
     }
 
