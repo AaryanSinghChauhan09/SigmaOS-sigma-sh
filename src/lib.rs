@@ -37,6 +37,11 @@ pub trait Fs {
     fn list(&self, path: &str) -> Option<Vec<String>>;
     /// Read a file's contents as string (lossy).
     fn read_to_string(&self, path: &str) -> Option<String>;
+    /// Write data to a file, creating it; `append` selects append mode.
+    /// Default: unsupported.
+    fn write_file(&self, _path: &str, _data: &str, _append: bool) -> bool {
+        false
+    }
     /// Current directory.
     fn cwd(&self) -> String;
 }
@@ -247,6 +252,10 @@ pub struct Shell<I, F, P, M, S> {
     pub history: Vec<String>,
     pub env: Vec<(String, String)>,
     pub last_ok: bool,
+    /// Active `>`/`>>` redirect target (path, append) for the current command.
+    pub redirect: Option<(String, bool)>,
+    /// Whether the current `>` target has been created/truncated already.
+    pub redirect_initialized: bool,
     pub running: bool,
 }
 
@@ -271,13 +280,15 @@ where
             history: Vec::new(),
             env: Vec::new(),
             last_ok: true,
+            redirect: None,
+            redirect_initialized: false,
             running: true,
         }
     }
 
     /// Run the REPL until EOF or `exit`.
     pub fn run(&mut self) {
-        self.io.writeln(&format!(
+        self.emit(&format!(
             "sigma-sh {} — type 'help'",
             env!("CARGO_PKG_VERSION")
         ));
@@ -336,10 +347,12 @@ where
             }
             return;
         }
-        // Try to parse as pipeline first
-        if let Some(pipeline) = parse_pipeline(line) {
-            self.execute_pipeline(&pipeline);
-            return;
+        // `|` pipelines (single `|` only; `||` was handled above).
+        if line.contains('|') {
+            if let Some(pipeline) = parse_pipeline(line) {
+                self.execute_pipeline(&pipeline);
+                return;
+            }
         }
 
         // Fall back to single command
@@ -347,38 +360,7 @@ where
             return;
         };
         let cmd = self.expand_command(cmd);
-        self.last_ok = is_builtin(&cmd.name);
-        match cmd.name.as_str() {
-            "help" | "?" => self.cmd_help(),
-            "exit" | "logout" | "quit" => self.running = false,
-            "true" | ":" => {}
-            "false" => self.last_ok = false,
-            "clear" => self.io.write("\x1b[2J\x1b[H"),
-            "echo" => self.io.writeln(&cmd.args.join(" ")),
-            "pwd" => self.io.writeln(&self.cwd),
-            "cd" => self.cmd_cd(&cmd.args),
-            "ls" => self.cmd_ls(&cmd.args),
-            "cat" => self.cmd_cat(&cmd.args),
-            "which" => self.cmd_which(&cmd.args),
-            "history" => self.cmd_history(),
-            "export" => self.cmd_export(&cmd.args),
-            "unset" => self.cmd_unset(&cmd.args),
-            "mem" => self.cmd_mem(),
-            "ps" => self.cmd_ps(),
-            "time" | "uptime" => self.io.writeln(&format_u64(self.sys.uptime())),
-            "launch" | "run" => self.cmd_launch(&cmd.args),
-            "reboot" => self.sys.reboot(),
-            "jobs" => self.cmd_jobs(),
-            "fg" => self.cmd_fg(&cmd.args),
-            "bg" => self.cmd_bg(&cmd.args),
-            _ => self
-                .io
-                .writeln(&format!("sigma-sh: {}: command not found", cmd.name)),
-        }
-        // `false` and unknown commands fail; other builtins succeed.
-        if is_builtin(&cmd.name) && cmd.name != "false" {
-            self.last_ok = true;
-        }
+        self.execute_single_command(&cmd);
     }
 
     /// Execute a pipeline of commands.
@@ -390,12 +372,30 @@ where
         // - Waiting for all processes in pipeline
         // For now, this is a stub that executes commands sequentially
         for cmd in &pipeline.commands {
-            self.io
-                .writeln(&format!("sigma-sh: pipeline: executing {}", cmd.name));
+            self.emit(&format!("sigma-sh: pipeline: executing {}", cmd.name));
             // Execute each command in sequence (no real piping yet)
             let expanded = self.expand_command(cmd.clone());
             self.execute_single_command(&expanded);
         }
+    }
+
+    /// Write raw output honoring an active `>`/`>>` redirect.
+    fn emit_raw(&mut self, s: &str) {
+        match &self.redirect {
+            Some((path, append)) => {
+                // First write to a `>` target truncates; later writes append.
+                let app = *append || self.redirect_initialized;
+                if self.fs.write_file(path, s, app) {
+                    self.redirect_initialized = true;
+                }
+            }
+            None => self.io.write(s),
+        }
+    }
+
+    /// Write a line of output honoring an active redirect.
+    fn emit(&mut self, s: &str) {
+        self.emit_raw(&format!("{}\n", s));
     }
 
     /// Expand `$VAR` and `${VAR}` in command args using the shell env.
@@ -488,8 +488,25 @@ where
         matches
     }
 
-    /// Execute a single command (helper for pipelines).
+    /// Execute a single command (helper for pipelines). Handles `>`/`>>`.
     fn execute_single_command(&mut self, cmd: &Command) {
+        // `>`/`>>` redirection: last occurrence wins, target resolved vs cwd.
+        let mut args = cmd.args.clone();
+        let mut redir = None;
+        if let Some(i) = args.iter().position(|a| a == ">" || a == ">>") {
+            let append = args[i] == ">>";
+            if i + 1 < args.len() {
+                redir = Some((self.resolve(Some(&args[i + 1])), append));
+                args.drain(i..=i + 1);
+            } else {
+                args.remove(i);
+            }
+        }
+        let prev_redir = self.redirect.take();
+        if let Some(r) = redir {
+            self.redirect = Some(r);
+            self.redirect_initialized = false;
+        }
         self.last_ok = is_builtin(&cmd.name);
         match cmd.name.as_str() {
             "help" | "?" => self.cmd_help(),
@@ -497,30 +514,32 @@ where
             "true" | ":" => {}
             "false" => self.last_ok = false,
             "clear" => self.io.write("\x1b[2J\x1b[H"),
-            "echo" => self.io.writeln(&cmd.args.join(" ")),
-            "pwd" => self.io.writeln(&self.cwd),
-            "cd" => self.cmd_cd(&cmd.args),
-            "ls" => self.cmd_ls(&cmd.args),
-            "cat" => self.cmd_cat(&cmd.args),
-            "which" => self.cmd_which(&cmd.args),
+            "echo" => self.emit(&args.join(" ")),
+            "pwd" => {
+                let c = self.cwd.clone();
+                self.emit(&c);
+            }
+            "cd" => self.cmd_cd(&args),
+            "ls" => self.cmd_ls(&args),
+            "cat" => self.cmd_cat(&args),
+            "which" => self.cmd_which(&args),
             "history" => self.cmd_history(),
-            "export" => self.cmd_export(&cmd.args),
-            "unset" => self.cmd_unset(&cmd.args),
+            "export" => self.cmd_export(&args),
+            "unset" => self.cmd_unset(&args),
             "mem" => self.cmd_mem(),
             "ps" => self.cmd_ps(),
-            "time" | "uptime" => self.io.writeln(&format_u64(self.sys.uptime())),
-            "launch" | "run" => self.cmd_launch(&cmd.args),
+            "time" | "uptime" => self.emit(&format_u64(self.sys.uptime())),
+            "launch" | "run" => self.cmd_launch(&args),
             "reboot" => self.sys.reboot(),
             "jobs" => self.cmd_jobs(),
-            "fg" => self.cmd_fg(&cmd.args),
-            "bg" => self.cmd_bg(&cmd.args),
-            _ => self
-                .io
-                .writeln(&format!("sigma-sh: {}: command not found", cmd.name)),
+            "fg" => self.cmd_fg(&args),
+            "bg" => self.cmd_bg(&args),
+            _ => self.emit(&format!("sigma-sh: {}: command not found", cmd.name)),
         }
         if is_builtin(&cmd.name) && cmd.name != "false" {
             self.last_ok = true;
         }
+        self.redirect = prev_redir;
     }
 
     fn cmd_help(&mut self) {
@@ -548,7 +567,7 @@ where
             "  reboot          restart the machine",
             "  exit            leave the shell",
         ] {
-            self.io.writeln(l);
+            self.emit(l);
         }
     }
 
@@ -576,7 +595,7 @@ where
             Some(a) if a == "-" => match self.oldpwd.clone() {
                 Some(prev) => prev,
                 None => {
-                    self.io.writeln("cd: OLDPWD not set");
+                    self.emit("cd: OLDPWD not set");
                     return;
                 }
             },
@@ -588,12 +607,10 @@ where
             Some(_) => {
                 self.oldpwd = Some(core::mem::replace(&mut self.cwd, norm.clone()));
                 if is_back {
-                    self.io.writeln(&norm);
+                    self.emit(&norm);
                 }
             }
-            None => self
-                .io
-                .writeln(&format!("cd: {}: no such directory", target)),
+            None => self.emit(&format!("cd: {}: no such directory", target)),
         }
     }
 
@@ -602,22 +619,22 @@ where
         match self.fs.list(&path) {
             Some(names) => {
                 for n in names {
-                    self.io.writeln(&n);
+                    self.emit(&n);
                 }
             }
-            None => self.io.writeln(&format!("ls: {}: no such directory", path)),
+            None => self.emit(&format!("ls: {}: no such directory", path)),
         }
     }
 
     fn cmd_cat(&mut self, args: &[String]) {
         let Some(a) = args.first() else {
-            self.io.writeln("cat: missing file");
+            self.emit("cat: missing file");
             return;
         };
         let path = self.resolve(Some(a));
         match self.fs.read_to_string(&path) {
-            Some(s) => self.io.write(&s),
-            None => self.io.writeln(&format!("cat: {}: no such file", path)),
+            Some(s) => self.emit_raw(&s),
+            None => self.emit(&format!("cat: {}: no such file", path)),
         }
     }
 
@@ -626,7 +643,7 @@ where
 
     fn cmd_which(&mut self, args: &[String]) {
         let Some(name) = args.first() else {
-            self.io.writeln("which: missing program name");
+            self.emit("which: missing program name");
             return;
         };
         if name.contains('/') {
@@ -643,33 +660,44 @@ where
                 None => false,
             };
             if found {
-                self.io.writeln(&path);
+                self.emit(&path);
             } else {
-                self.io.writeln(&format!("which: no {} in {}", name, path));
+                self.emit(&format!("which: no {} in {}", name, path));
             }
             return;
         }
         for dir in Self::WHICH_PATH {
             if let Some(names) = self.fs.list(dir) {
                 if names.iter().any(|n| n == name) {
-                    self.io.writeln(&format!("{}/{}", dir, name));
+                    self.emit(&format!("{}/{}", dir, name));
                     return;
                 }
             }
         }
-        self.io.writeln(&format!("which: no {} in PATH", name));
+        self.emit(&format!("which: no {} in PATH", name));
     }
 
     fn cmd_history(&mut self) {
-        for (i, h) in self.history.iter().enumerate() {
-            self.io.writeln(&format!("{:4}  {}", i + 1, h));
+        let lines: Vec<String> = self
+            .history
+            .iter()
+            .enumerate()
+            .map(|(i, h)| format!("{:4}  {}", i + 1, h))
+            .collect();
+        for l in lines {
+            self.emit(&l);
         }
     }
 
     fn cmd_export(&mut self, args: &[String]) {
         if args.is_empty() {
-            for (k, v) in &self.env {
-                self.io.writeln(&format!("export {}={}", k, v));
+            let lines: Vec<String> = self
+                .env
+                .iter()
+                .map(|(k, v)| format!("export {}={}", k, v))
+                .collect();
+            for l in lines {
+                self.emit(&l);
             }
             return;
         }
@@ -682,9 +710,7 @@ where
                         self.env.push((k.to_string(), v.to_string()));
                     }
                 }
-                _ => self
-                    .io
-                    .writeln(&format!("export: {}: not a valid assignment", a)),
+                _ => self.emit(&format!("export: {}: not a valid assignment", a)),
             }
         }
     }
@@ -697,19 +723,18 @@ where
 
     fn cmd_mem(&mut self) {
         let (total, free) = self.mem.memory_kb();
-        self.io
-            .writeln(&format!("mem: {} KiB total, {} KiB free", total, free));
+        self.emit(&format!("mem: {} KiB total, {} KiB free", total, free));
     }
 
     fn cmd_ps(&mut self) {
         for row in self.procs.list() {
-            self.io.writeln(&row);
+            self.emit(&row);
         }
     }
 
     fn cmd_launch(&mut self, args: &[String]) {
         let Some(prog) = args.first() else {
-            self.io.writeln("launch: missing program");
+            self.emit("launch: missing program");
             return;
         };
         // Bare names resolve through PATH dirs, like a real shell.
@@ -731,25 +756,24 @@ where
             resolved.as_str()
         };
         match self.sys.launch(prog, &args[1..]) {
-            Ok(pid) => self.io.writeln(&format!("launched {} (pid {})", prog, pid)),
-            Err(e) => self.io.writeln(&format!("launch: {}: {}", prog, e)),
+            Ok(pid) => self.emit(&format!("launched {} (pid {})", prog, pid)),
+            Err(e) => self.emit(&format!("launch: {}: {}", prog, e)),
         }
     }
 
     /// Job control: list background jobs (stub for now)
     fn cmd_jobs(&mut self) {
-        self.io
-            .writeln("jobs: no background jobs (job control not implemented)");
+        self.emit("jobs: no background jobs (job control not implemented)");
     }
 
     /// Job control: bring job to foreground (stub for now)
     fn cmd_fg(&mut self, _args: &[String]) {
-        self.io.writeln("fg: job control not implemented");
+        self.emit("fg: job control not implemented");
     }
 
     /// Job control: send job to background (stub for now)
     fn cmd_bg(&mut self, _args: &[String]) {
-        self.io.writeln("bg: job control not implemented");
+        self.emit("bg: job control not implemented");
     }
 }
 
@@ -847,7 +871,10 @@ mod tests {
         }
     }
 
-    struct TestFs;
+    #[derive(Default)]
+    struct TestFs {
+        writes: Rc<RefCell<Vec<(String, String, bool)>>>,
+    }
     impl Fs for TestFs {
         fn list(&self, path: &str) -> Option<Vec<String>> {
             match path {
@@ -861,6 +888,12 @@ mod tests {
                 "/etc/hostname" => Some("sigmaos\n".to_string()),
                 _ => None,
             }
+        }
+        fn write_file(&self, path: &str, data: &str, append: bool) -> bool {
+            self.writes
+                .borrow_mut()
+                .push((path.to_string(), data.to_string(), append));
+            true
         }
         fn cwd(&self) -> String {
             "/".into()
@@ -909,7 +942,7 @@ mod tests {
                 input: lines.iter().map(|s| s.to_string()).collect(),
                 output: out.clone(),
             },
-            TestFs,
+            TestFs::default(),
             TestProcs,
             TestMem,
             TestSys { launched },
@@ -1060,6 +1093,24 @@ mod tests {
         let launched = sh.sys.launched.borrow();
         assert_eq!(launched.as_slice(), &["/bin/sh".to_string()]);
         assert!(out.borrow().contains("launched /bin/sh (pid 100)"));
+    }
+
+    #[test]
+    fn redirect_writes_file() {
+        let (mut sh, out) = shell(&[
+            "echo hello > /tmp/out",
+            "echo world >> /tmp/out",
+            "pwd > /tmp/pwd",
+            "exit",
+        ]);
+        sh.run();
+        // Redirected output must not hit stdout.
+        assert!(!out.borrow().contains("hello"));
+        let writes = sh.fs.writes.borrow();
+        // `>` truncates on first write, `>>` always appends.
+        assert!(writes.contains(&("/tmp/out".to_string(), "hello\n".to_string(), false)));
+        assert!(writes.contains(&("/tmp/out".to_string(), "world\n".to_string(), true)));
+        assert!(writes.contains(&("/tmp/pwd".to_string(), "/\n".to_string(), false)));
     }
 
     #[test]

@@ -51,6 +51,27 @@ impl Fs for StdFs {
         };
         std::fs::read_to_string(p).ok()
     }
+    fn write_file(&self, path: &str, data: &str, append: bool) -> bool {
+        use std::fs::OpenOptions;
+        let p = if path.starts_with('/') {
+            PathBuf::from(path)
+        } else {
+            self.cwd.join(path)
+        };
+        let r = if append {
+            OpenOptions::new().append(true).open(&p)
+        } else {
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&p)
+        };
+        match r {
+            Ok(mut f) => f.write_all(data.as_bytes()).is_ok(),
+            Err(_) => false,
+        }
+    }
     fn cwd(&self) -> String {
         self.cwd.display().to_string()
     }
