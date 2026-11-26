@@ -1,8 +1,9 @@
 //! SigmaOS sigma-sh — minimal rescue shell.
 //!
 //! Builtins: help, ls, pwd, cd, echo, cat, which, history, export, unset,
-//! mem, ps, time, launch, reboot, true/false/:/clear, plus `*` glob
-//! expansion in arguments. `launch` resolves bare names through PATH.
+//! mem, ps, time, launch, reboot, true/false/:/clear, mkdir/rmdir/rm/touch,
+//! `>`/`>>` redirection, plus `*` glob expansion in arguments.
+//! `launch` resolves bare names through PATH.
 //! exit. I/O and filesystem access go through traits so the shell is
 //! fully testable on host and pluggable to sigma-sys at runtime.
 
@@ -40,6 +41,14 @@ pub trait Fs {
     /// Write data to a file, creating it; `append` selects append mode.
     /// Default: unsupported.
     fn write_file(&self, _path: &str, _data: &str, _append: bool) -> bool {
+        false
+    }
+    /// Create a directory (parents must exist). Default: unsupported.
+    fn create_dir(&self, _path: &str) -> bool {
+        false
+    }
+    /// Remove a file or empty directory. Default: unsupported.
+    fn remove_path(&self, _path: &str) -> bool {
         false
     }
     /// Current directory.
@@ -526,6 +535,10 @@ where
             "history" => self.cmd_history(),
             "export" => self.cmd_export(&args),
             "unset" => self.cmd_unset(&args),
+            "mkdir" => self.cmd_mkdir(&args),
+            "rmdir" => self.cmd_rmdir(&args),
+            "rm" => self.cmd_rm(&args),
+            "touch" => self.cmd_touch(&args),
             "mem" => self.cmd_mem(),
             "ps" => self.cmd_ps(),
             "time" | "uptime" => self.emit(&format_u64(self.sys.uptime())),
@@ -555,6 +568,10 @@ where
             "  history         list command history",
             "  export V=val    set an environment variable",
             "  unset V         remove an environment variable",
+            "  mkdir <dir>     create a directory",
+            "  rmdir <dir>     remove an empty directory",
+            "  rm <file>       remove a file",
+            "  touch <file>    create an empty file",
             "  true/:/false    no-op / fail (for && and ||)",
             "  clear           clear the screen",
             "  mem             memory usage",
@@ -715,6 +732,65 @@ where
         }
     }
 
+    fn cmd_mkdir(&mut self, args: &[String]) {
+        if args.is_empty() {
+            self.emit("mkdir: missing directory");
+            return;
+        }
+        for a in args {
+            let path = self.resolve(Some(a));
+            if self.fs.create_dir(&path) {
+                // success is silent, like mkdir
+            } else {
+                self.emit(&format!("mkdir: cannot create {}", path));
+            }
+        }
+    }
+
+    fn cmd_rmdir(&mut self, args: &[String]) {
+        if args.is_empty() {
+            self.emit("rmdir: missing directory");
+            return;
+        }
+        for a in args {
+            let path = self.resolve(Some(a));
+            if self.fs.remove_path(&path) {
+                // silent on success
+            } else {
+                self.emit(&format!("rmdir: {}: failed", path));
+            }
+        }
+    }
+
+    fn cmd_rm(&mut self, args: &[String]) {
+        if args.is_empty() {
+            self.emit("rm: missing file");
+            return;
+        }
+        for a in args {
+            let path = self.resolve(Some(a));
+            if self.fs.remove_path(&path) {
+                // silent on success
+            } else {
+                self.emit(&format!("rm: cannot remove {}", path));
+            }
+        }
+    }
+
+    fn cmd_touch(&mut self, args: &[String]) {
+        if args.is_empty() {
+            self.emit("touch: missing file");
+            return;
+        }
+        for a in args {
+            let path = self.resolve(Some(a));
+            // Append-mode write of nothing creates the file without truncating.
+            if !self.fs.write_file(&path, "", true) {
+                self.emit(&format!("touch: cannot create {}", path));
+            }
+        }
+    }
+
     fn cmd_unset(&mut self, args: &[String]) {
         for a in args {
             self.env.retain(|(k, _)| k != a);
@@ -828,6 +904,10 @@ fn is_builtin(name: &str) -> bool {
             | "history"
             | "export"
             | "unset"
+            | "mkdir"
+            | "rmdir"
+            | "rm"
+            | "touch"
             | "mem"
             | "ps"
             | "time"
@@ -874,6 +954,8 @@ mod tests {
     #[derive(Default)]
     struct TestFs {
         writes: Rc<RefCell<Vec<(String, String, bool)>>>,
+        dirs: Rc<RefCell<Vec<String>>>,
+        removed: Rc<RefCell<Vec<String>>>,
     }
     impl Fs for TestFs {
         fn list(&self, path: &str) -> Option<Vec<String>> {
@@ -893,6 +975,14 @@ mod tests {
             self.writes
                 .borrow_mut()
                 .push((path.to_string(), data.to_string(), append));
+            true
+        }
+        fn create_dir(&self, path: &str) -> bool {
+            self.dirs.borrow_mut().push(path.to_string());
+            true
+        }
+        fn remove_path(&self, path: &str) -> bool {
+            self.removed.borrow_mut().push(path.to_string());
             true
         }
         fn cwd(&self) -> String {
@@ -1111,6 +1201,29 @@ mod tests {
         assert!(writes.contains(&("/tmp/out".to_string(), "hello\n".to_string(), false)));
         assert!(writes.contains(&("/tmp/out".to_string(), "world\n".to_string(), true)));
         assert!(writes.contains(&("/tmp/pwd".to_string(), "/\n".to_string(), false)));
+    }
+
+    #[test]
+    fn fs_mutation_builtins() {
+        let (mut sh, _out) = shell(&[
+            "mkdir /tmp/dir",
+            "touch /tmp/newfile",
+            "rm /tmp/newfile",
+            "rmdir /tmp/dir",
+            "exit",
+        ]);
+        sh.run();
+        assert_eq!(sh.fs.dirs.borrow().as_slice(), &["/tmp/dir".to_string()]);
+        assert!(sh
+            .fs
+            .writes
+            .borrow()
+            .iter()
+            .any(|(p, d, a)| { p == "/tmp/newfile" && d.is_empty() && *a }));
+        assert_eq!(
+            sh.fs.removed.borrow().as_slice(),
+            &["/tmp/newfile".to_string(), "/tmp/dir".to_string()]
+        );
     }
 
     #[test]

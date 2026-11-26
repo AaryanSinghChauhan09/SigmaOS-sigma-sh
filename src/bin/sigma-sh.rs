@@ -59,7 +59,7 @@ impl Fs for StdFs {
             self.cwd.join(path)
         };
         let r = if append {
-            OpenOptions::new().append(true).open(&p)
+            OpenOptions::new().create(true).append(true).open(&p)
         } else {
             OpenOptions::new()
                 .write(true)
@@ -71,6 +71,22 @@ impl Fs for StdFs {
             Ok(mut f) => f.write_all(data.as_bytes()).is_ok(),
             Err(_) => false,
         }
+    }
+    fn create_dir(&self, path: &str) -> bool {
+        let p = if path.starts_with('/') {
+            PathBuf::from(path)
+        } else {
+            self.cwd.join(path)
+        };
+        std::fs::create_dir(p).is_ok()
+    }
+    fn remove_path(&self, path: &str) -> bool {
+        let p = if path.starts_with('/') {
+            PathBuf::from(path)
+        } else {
+            self.cwd.join(path)
+        };
+        std::fs::remove_file(&p).is_ok() || std::fs::remove_dir(&p).is_ok()
     }
     fn cwd(&self) -> String {
         self.cwd.display().to_string()
