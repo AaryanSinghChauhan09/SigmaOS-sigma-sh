@@ -132,6 +132,7 @@ pub struct Shell<I, F, P, M, S> {
     pub mem: M,
     pub sys: S,
     pub cwd: String,
+    pub oldpwd: Option<String>,
     pub running: bool,
 }
 
@@ -152,6 +153,7 @@ where
             mem,
             sys,
             cwd: "/".into(),
+            oldpwd: None,
             running: true,
         }
     }
@@ -292,6 +294,13 @@ where
         let target = match args.first() {
             None => "/".to_string(),
             Some(a) if a == "~" => "/".to_string(),
+            Some(a) if a == "-" => match self.oldpwd.clone() {
+                Some(prev) => prev,
+                None => {
+                    self.io.writeln("cd: OLDPWD not set");
+                    return;
+                }
+            },
             Some(a) => self.resolve(Some(a)),
         };
         // Normalize "." and ".." segments.
@@ -312,8 +321,14 @@ where
             p.push_str(&parts.join("/"));
             p
         };
+        let is_back = args.first().is_some_and(|a| a == "-");
         match self.fs.list(&norm) {
-            Some(_) => self.cwd = norm,
+            Some(_) => {
+                self.oldpwd = Some(core::mem::replace(&mut self.cwd, norm.clone()));
+                if is_back {
+                    self.io.writeln(&norm);
+                }
+            }
             None => self
                 .io
                 .writeln(&format!("cd: {}: no such directory", target)),
@@ -595,6 +610,15 @@ mod tests {
         // cd /bin then pwd -> /bin appears; cd .. returns to /; cd /nope fails.
         assert!(o.contains("/bin"));
         assert!(o.contains("cd: /nope: no such directory"));
+    }
+
+    #[test]
+    fn cd_dash_returns_to_oldpwd() {
+        let (mut sh, out) = shell(&["cd -", "cd /bin", "pwd", "cd -", "pwd", "exit"]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("cd: OLDPWD not set"));
+        assert!(o.contains("/bin"));
     }
 
     #[test]
