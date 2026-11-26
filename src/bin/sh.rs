@@ -141,7 +141,17 @@ impl Fs for SysFs {
         ok
     }
 
-    // create_dir/remove_path keep trait defaults (unsupported).
+    fn create_dir(&self, path: &str) -> bool {
+        sys::api::mkdir(path).is_ok()
+    }
+
+    fn remove_path(&self, path: &str) -> bool {
+        // rm uses unlink for files; rmdir builtin calls this too —
+        // try unlink first, then rmdir for directories.
+        sys::api::unlink(path)
+            .or_else(|_| sys::api::remove_dir(path))
+            .is_ok()
+    }
 
     fn cwd(&self) -> String {
         "/".to_string()
