@@ -51,6 +51,10 @@ pub trait Fs {
     fn remove_path(&self, _path: &str) -> bool {
         false
     }
+    /// File metadata: (is_dir, size_bytes). Default: unsupported.
+    fn stat(&self, _path: &str) -> Option<(bool, u64)> {
+        None
+    }
     /// Current directory.
     fn cwd(&self) -> String;
 }
@@ -635,7 +639,7 @@ where
         for l in [
             "builtins:",
             "  help            show this text",
-            "  ls [dir]        list directory",
+            "  ls [-l] [dir]   list directory (-l = long format)",
             "  pwd             print working directory",
             "  cd [dir]        change directory",
             "  echo <text>     print text",
@@ -728,11 +732,30 @@ where
     }
 
     fn cmd_ls(&mut self, args: &[String]) {
-        let path = self.resolve(args.first());
+        let long = args.iter().any(|a| a == "-l" || a == "-la" || a == "-al");
+        let path_arg = args.iter().find(|a| !a.starts_with('-'));
+        let path = self.resolve(path_arg);
         match self.fs.list(&path) {
             Some(names) => {
                 for n in names {
-                    self.emit(&n);
+                    if long {
+                        let child = format!("{}/{}", path.trim_end_matches('/'), n);
+                        match self.fs.stat(&child) {
+                            Some((is_dir, size)) => {
+                                let kind = if is_dir { 'd' } else { '-' };
+                                self.emit(&format!(
+                                    "{}{} {:>8} {}",
+                                    kind,
+                                    if is_dir { "rwxr-xr-x" } else { "rw-r--r--" },
+                                    size,
+                                    n
+                                ));
+                            }
+                            None => self.emit(&format!("-????????? {:>8} {}", "?", n)),
+                        }
+                    } else {
+                        self.emit(&n);
+                    }
                 }
             }
             None => {

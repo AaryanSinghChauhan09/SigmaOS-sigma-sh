@@ -153,6 +153,10 @@ impl Fs for SysFs {
             .is_ok()
     }
 
+    fn stat(&self, path: &str) -> Option<(bool, u64)> {
+        sys::api::stat(path).ok().map(|s| (s.is_dir(), s.size))
+    }
+
     fn cwd(&self) -> String {
         "/".to_string()
     }
