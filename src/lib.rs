@@ -77,8 +77,9 @@ pub trait System {
     fn uptime(&self) -> u64;
     /// Sleep for `secs` seconds. Default: no-op.
     fn sleep(&self, _secs: u64) {}
-    /// Send SIGTERM to `pid`; returns success. Default: unsupported.
-    fn kill(&self, _pid: i64) -> bool {
+    /// Send signal `sig` (name like "TERM"/"KILL" or number like "9")
+    /// to `pid`; returns success. Default: unsupported.
+    fn kill(&self, _pid: i64, _sig: &str) -> bool {
         false
     }
     /// Kernel/OS name for `uname`. Default: sigmaos.
@@ -1222,11 +1223,16 @@ where
     }
 
     fn cmd_kill(&mut self, args: &[String]) {
-        // Accept optional signal flag (-9, -KILL, -TERM, -15) then pid.
+        // `kill [-SIG] pid` — first dash-arg selects the signal
+        // ("-9", "-KILL", "-SIGTERM"), default SIGTERM.
+        let mut sig = String::from("TERM");
         let mut pid_arg: Option<&String> = None;
         for a in args {
-            if a.starts_with('-') {
-                continue; // signal selection not yet plumbed to System::kill
+            if let Some(s) = a.strip_prefix('-') {
+                if !s.is_empty() {
+                    sig = s.trim_start_matches("SIG").to_string();
+                }
+                continue;
             }
             pid_arg = Some(a);
             break;
@@ -1237,7 +1243,7 @@ where
             return;
         };
         match p.parse::<i64>() {
-            Ok(pid) if self.sys.kill(pid) => {}
+            Ok(pid) if self.sys.kill(pid, &sig) => {}
             _ => {
                 self.last_ok = false;
                 self.emit(&format!("kill: {}: no such process", p));
@@ -1423,7 +1429,7 @@ mod tests {
 
     struct TestSys {
         launched: Rc<RefCell<Vec<String>>>,
-        killed: Rc<RefCell<Vec<i64>>>,
+        killed: Rc<RefCell<Vec<(i64, String)>>>,
     }
     impl System for TestSys {
         fn reboot(&self) {}
@@ -1434,8 +1440,8 @@ mod tests {
         fn uptime(&self) -> u64 {
             3600
         }
-        fn kill(&self, pid: i64) -> bool {
-            self.killed.borrow_mut().push(pid);
+        fn kill(&self, pid: i64, sig: &str) -> bool {
+            self.killed.borrow_mut().push((pid, sig.to_string()));
             true
         }
     }
@@ -1733,9 +1739,16 @@ mod tests {
 
     #[test]
     fn kill_sends_signal() {
-        let (mut sh, _out) = shell(&["kill 42", "kill -9 7", "kill", "exit"]);
+        let (mut sh, _out) = shell(&["kill 42", "kill -9 7", "kill -SIGKILL 9", "kill", "exit"]);
         sh.run();
-        assert_eq!(sh.sys.killed.borrow().as_slice(), &[42, 7]);
+        assert_eq!(
+            sh.sys.killed.borrow().as_slice(),
+            &[
+                (42, "TERM".to_string()),
+                (7, "9".to_string()),
+                (9, "KILL".to_string())
+            ]
+        );
     }
 
     #[test]
