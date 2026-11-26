@@ -545,6 +545,9 @@ where
             "tail" => self.cmd_head_tail(&args, false),
             "wc" => self.cmd_wc(&args),
             "grep" => self.cmd_grep(&args),
+            "sort" => self.cmd_sort(&args),
+            "uniq" => self.cmd_uniq(&args),
+            "find" => self.cmd_find(&args),
             "mem" => self.cmd_mem(),
             "ps" => self.cmd_ps(),
             "time" | "uptime" => self.emit(&format_u64(self.sys.uptime())),
@@ -584,6 +587,9 @@ where
             "  tail [-n N] <f> print last N lines",
             "  wc <file>       count lines, words, bytes",
             "  grep [-ivnc] <pat> <file>  search file contents",
+            "  sort [-r] <file>    sort lines",
+            "  uniq <file>         collapse adjacent duplicate lines",
+            "  find [dir]          list files recursively",
             "  true/:/false    no-op / fail (for && and ||)",
             "  clear           clear the screen",
             "  mem             memory usage",
@@ -937,6 +943,74 @@ where
         }
     }
 
+    fn cmd_sort(&mut self, args: &[String]) {
+        let reverse = args.iter().any(|a| a == "-r");
+        let file = args.iter().find(|a| !a.starts_with('-'));
+        let Some(f) = file else {
+            self.emit("sort: missing file");
+            return;
+        };
+        let path = self.resolve(Some(f));
+        let Some(data) = self.fs.read_to_string(&path) else {
+            self.emit(&format!("sort: {}: no such file", path));
+            return;
+        };
+        let mut lines: Vec<String> = data.lines().map(str::to_string).collect();
+        lines.sort();
+        if reverse {
+            lines.reverse();
+        }
+        for l in lines {
+            self.emit(&l);
+        }
+    }
+
+    fn cmd_uniq(&mut self, args: &[String]) {
+        let Some(f) = args.first() else {
+            self.emit("uniq: missing file");
+            return;
+        };
+        let path = self.resolve(Some(f));
+        let Some(data) = self.fs.read_to_string(&path) else {
+            self.emit(&format!("uniq: {}: no such file", path));
+            return;
+        };
+        let mut prev: Option<&str> = None;
+        for line in data.lines() {
+            if prev != Some(line) {
+                self.emit(line);
+            }
+            prev = Some(line);
+        }
+    }
+
+    /// `find [dir]` — recursive listing via `Fs::list`.
+    fn cmd_find(&mut self, args: &[String]) {
+        let start = args
+            .first()
+            .map(|a| self.resolve(Some(a)))
+            .unwrap_or_else(|| self.cwd.clone());
+        let mut stack = alloc::vec![start.clone()];
+        while let Some(dir) = stack.pop() {
+            let Some(names) = self.fs.list(&dir) else {
+                self.emit(&format!("find: {}: no such directory", dir));
+                continue;
+            };
+            for n in names {
+                let path = if dir == "/" {
+                    format!("/{}", n)
+                } else {
+                    format!("{}/{}", dir, n)
+                };
+                self.emit(&path);
+                // Recurse into subdirectories.
+                if self.fs.list(&path).is_some() {
+                    stack.push(path);
+                }
+            }
+        }
+    }
+
     fn cmd_unset(&mut self, args: &[String]) {
         for a in args {
             self.env.retain(|(k, _)| k != a);
@@ -1060,6 +1134,9 @@ fn is_builtin(name: &str) -> bool {
             | "tail"
             | "wc"
             | "grep"
+            | "sort"
+            | "uniq"
+            | "find"
             | "mem"
             | "ps"
             | "time"
@@ -1121,6 +1198,7 @@ mod tests {
             match path {
                 "/etc/hostname" => Some("sigmaos\n".to_string()),
                 "/tmp/multi" => Some("l1\nl2\nl3\n".to_string()),
+                "/tmp/dups" => Some("b\na\na\nc\n".to_string()),
                 _ => None,
             }
         }
@@ -1404,6 +1482,17 @@ mod tests {
         assert!(o.contains("l2"));
         assert!(o.contains("l3"));
         assert!(o.contains("3 3 9 /tmp/multi"));
+    }
+
+    #[test]
+    fn sort_uniq_find_work() {
+        let (mut sh, out) = shell(&["sort /tmp/dups", "uniq /tmp/dups", "find /bin", "exit"]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("a\nb\nc\n"), "sort order wrong: {}", o);
+        assert!(o.contains("b\na\nc\n"), "uniq output wrong: {}", o);
+        assert!(o.contains("/bin/sh"));
+        assert!(o.contains("/bin/init"));
     }
 
     #[test]
