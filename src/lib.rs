@@ -1,6 +1,7 @@
 //! SigmaOS sigma-sh — minimal rescue shell.
 //!
-//! Builtins: help, ls, pwd, cd, echo, cat, which, history, mem, ps, time, launch, reboot,
+//! Builtins: help, ls, pwd, cd, echo, cat, which, history, export, unset,
+//! mem, ps, time, launch, reboot,
 //! exit. I/O and filesystem access go through traits so the shell is
 //! fully testable on host and pluggable to sigma-sys at runtime.
 
@@ -162,6 +163,7 @@ pub struct Shell<I, F, P, M, S> {
     pub cwd: String,
     pub oldpwd: Option<String>,
     pub history: Vec<String>,
+    pub env: Vec<(String, String)>,
     pub running: bool,
 }
 
@@ -184,6 +186,7 @@ where
             cwd: "/".into(),
             oldpwd: None,
             history: Vec::new(),
+            env: Vec::new(),
             running: true,
         }
     }
@@ -229,6 +232,7 @@ where
         let Some(cmd) = parse(line) else {
             return;
         };
+        let cmd = self.expand_command(cmd);
         match cmd.name.as_str() {
             "help" | "?" => self.cmd_help(),
             "exit" | "logout" | "quit" => self.running = false,
@@ -239,6 +243,8 @@ where
             "cat" => self.cmd_cat(&cmd.args),
             "which" => self.cmd_which(&cmd.args),
             "history" => self.cmd_history(),
+            "export" => self.cmd_export(&cmd.args),
+            "unset" => self.cmd_unset(&cmd.args),
             "mem" => self.cmd_mem(),
             "ps" => self.cmd_ps(),
             "time" | "uptime" => self.io.writeln(&format_u64(self.sys.uptime())),
@@ -265,7 +271,55 @@ where
             self.io
                 .writeln(&format!("sigma-sh: pipeline: executing {}", cmd.name));
             // Execute each command in sequence (no real piping yet)
-            self.execute_single_command(cmd);
+            let expanded = self.expand_command(cmd.clone());
+            self.execute_single_command(&expanded);
+        }
+    }
+
+    /// Expand `$VAR` and `${VAR}` in command args using the shell env.
+    fn expand(&self, s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '$' {
+                out.push(c);
+                continue;
+            }
+            let name = if chars.peek() == Some(&'{') {
+                chars.next();
+                let mut n = String::new();
+                for c in chars.by_ref() {
+                    if c == '}' {
+                        break;
+                    }
+                    n.push(c);
+                }
+                n
+            } else {
+                let mut n = String::new();
+                while chars
+                    .peek()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
+                {
+                    n.push(chars.next().unwrap());
+                }
+                n
+            };
+            if name.is_empty() {
+                out.push('$');
+                continue;
+            }
+            if let Some((_, v)) = self.env.iter().find(|(k, _)| *k == name) {
+                out.push_str(v);
+            }
+        }
+        out
+    }
+
+    fn expand_command(&self, cmd: Command) -> Command {
+        Command {
+            name: cmd.name,
+            args: cmd.args.iter().map(|a| self.expand(a)).collect(),
         }
     }
 
@@ -281,6 +335,8 @@ where
             "cat" => self.cmd_cat(&cmd.args),
             "which" => self.cmd_which(&cmd.args),
             "history" => self.cmd_history(),
+            "export" => self.cmd_export(&cmd.args),
+            "unset" => self.cmd_unset(&cmd.args),
             "mem" => self.cmd_mem(),
             "ps" => self.cmd_ps(),
             "time" | "uptime" => self.io.writeln(&format_u64(self.sys.uptime())),
@@ -306,6 +362,8 @@ where
             "  cat <file>      print file",
             "  which <prog>    locate a program on PATH",
             "  history         list command history",
+            "  export V=val    set an environment variable",
+            "  unset V         remove an environment variable",
             "  mem             memory usage",
             "  ps              process list",
             "  time            uptime seconds",
@@ -448,6 +506,35 @@ where
     fn cmd_history(&mut self) {
         for (i, h) in self.history.iter().enumerate() {
             self.io.writeln(&format!("{:4}  {}", i + 1, h));
+        }
+    }
+
+    fn cmd_export(&mut self, args: &[String]) {
+        if args.is_empty() {
+            for (k, v) in &self.env {
+                self.io.writeln(&format!("export {}={}", k, v));
+            }
+            return;
+        }
+        for a in args {
+            match a.split_once('=') {
+                Some((k, v)) if !k.is_empty() => {
+                    if let Some(e) = self.env.iter_mut().find(|(ek, _)| ek == k) {
+                        e.1 = v.to_string();
+                    } else {
+                        self.env.push((k.to_string(), v.to_string()));
+                    }
+                }
+                _ => self
+                    .io
+                    .writeln(&format!("export: {}: not a valid assignment", a)),
+            }
+        }
+    }
+
+    fn cmd_unset(&mut self, args: &[String]) {
+        for a in args {
+            self.env.retain(|(k, _)| k != a);
         }
     }
 
@@ -691,6 +778,23 @@ mod tests {
         let o = out.borrow();
         assert!(o.contains("echo hi"));
         assert!(o.contains("pwd"));
+    }
+
+    #[test]
+    fn export_and_expand() {
+        let (mut sh, out) = shell(&[
+            "export FOO=bar",
+            "echo $FOO",
+            "echo ${FOO}-baz",
+            "unset FOO",
+            "echo [$FOO]",
+            "exit",
+        ]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("bar"));
+        assert!(o.contains("bar-baz"));
+        assert!(o.contains("[]"));
     }
 
     #[test]
