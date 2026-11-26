@@ -124,6 +124,34 @@ pub fn parse_pipeline(line: &str) -> Option<Pipeline> {
     }
 }
 
+/// Split a line on `;` outside double quotes.
+pub fn split_semicolons(line: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote = false;
+    for c in line.chars() {
+        match c {
+            '"' => {
+                in_quote = !in_quote;
+                cur.push(c);
+            }
+            ';' if !in_quote => {
+                let t = cur.trim();
+                if !t.is_empty() {
+                    parts.push(t.to_string());
+                }
+                cur.clear();
+            }
+            _ => cur.push(c),
+        }
+    }
+    let t = cur.trim();
+    if !t.is_empty() {
+        parts.push(t.to_string());
+    }
+    parts
+}
+
 /// The shell.
 pub struct Shell<I, F, P, M, S> {
     pub io: I,
@@ -175,6 +203,16 @@ where
 
     /// Execute one command line.
     pub fn execute(&mut self, line: &str) {
+        // `;` separates commands (quote-aware).
+        let parts = split_semicolons(line);
+        if parts.len() > 1 {
+            for part in parts {
+                if self.running {
+                    self.execute(&part);
+                }
+            }
+            return;
+        }
         // Try to parse as pipeline first
         if let Some(pipeline) = parse_pipeline(line) {
             self.execute_pipeline(&pipeline);
@@ -619,6 +657,16 @@ mod tests {
         let o = out.borrow();
         assert!(o.contains("cd: OLDPWD not set"));
         assert!(o.contains("/bin"));
+    }
+
+    #[test]
+    fn semicolons_separate_commands() {
+        let (mut sh, out) = shell(&["echo one; echo two", "echo \"a;b\"", "exit"]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("one"));
+        assert!(o.contains("two"));
+        assert!(o.contains("a;b"));
     }
 
     #[test]
