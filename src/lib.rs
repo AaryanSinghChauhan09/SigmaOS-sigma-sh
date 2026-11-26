@@ -1037,6 +1037,14 @@ where
                 args.remove(i);
             }
         }
+        // `2>&1` — stderr follows stdout's redirect target. Resolved
+        // after `>`/`2>` parsing so `> out 2>&1` shares one fd; with no
+        // `>` it is a no-op (both streams already share the console).
+        let mut err_follows_out = false;
+        while let Some(i) = args.iter().position(|a| a == "2>&1") {
+            args.remove(i);
+            err_follows_out = true;
+        }
         // `2>`/`2>>` stderr redirection (launch only; same fd mechanism).
         if let Some(i) = args
             .iter()
@@ -1057,6 +1065,9 @@ where
             } else {
                 args.remove(i);
             }
+        }
+        if err_follows_out && err_redir.is_none() {
+            err_redir = redir.clone();
         }
         // `<` input redirection: for `launch` it becomes the child's
         // stdin fd; for builtins it feeds pending_stdin as before.
@@ -1259,7 +1270,7 @@ where
             "  ps              process list",
             "  time            uptime seconds",
             "  launch <prog>   run a program (& = background, the default)",
-            "  redirects       > >> 2> 2>> &> &>>  and  < file  (real fds for launch)",
+            "  redirects       > >> 2> 2>> &> &>> 2>&1  and  < file  (real fds for launch)",
             "  wait [pid]      wait for a child to exit",
             "  jobs            list background jobs",
             "  fg <job>        bring job to foreground",
@@ -2926,6 +2937,23 @@ mod tests {
         );
         let fds = sh.sys.fds.borrow();
         assert_eq!(fds.as_slice(), &[(101, 0, 101), (0, 0, 102)]);
+    }
+
+    #[test]
+    fn stderr_follows_stdout_redirect() {
+        let (mut sh, _out) = shell(&[
+            "launch /bin/sh > /tmp/out 2>&1",
+            "launch /bin/sh 2>&1",
+            "exit",
+        ]);
+        sh.run();
+        // `> out 2>&1` shares one fd like `&>`; bare `2>&1` is a no-op.
+        assert_eq!(
+            sh.fs.open_log.borrow().as_slice(),
+            &[("/tmp/out".to_string(), false)]
+        );
+        let fds = sh.sys.fds.borrow();
+        assert_eq!(fds.as_slice(), &[(101, 0, 101), (0, 0, 0)]);
     }
 
     #[test]
