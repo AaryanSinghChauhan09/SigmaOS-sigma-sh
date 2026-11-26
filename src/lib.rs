@@ -182,7 +182,16 @@ pub fn parse(line: &str) -> Option<Command> {
     let mut cur_q: u8 = 0;
     let mut in_dquote = false;
     let mut in_squote = false;
+    // `$(...)` substitution depth: whitespace inside it must not split
+    // args, and `)` only closes when depth > 0.
+    let mut sub_depth = 0usize;
+    let mut prev_dollar = false;
     for c in chars {
+        let opens_sub = prev_dollar && c == '(' && !in_dquote && !in_squote;
+        prev_dollar = c == '$' && !in_dquote && !in_squote;
+        if opens_sub {
+            sub_depth += 1;
+        }
         match c {
             '"' if !in_squote => {
                 in_dquote = !in_dquote;
@@ -192,7 +201,11 @@ pub fn parse(line: &str) -> Option<Command> {
                 in_squote = !in_squote;
                 cur_q |= 1;
             }
-            c if c.is_whitespace() && !in_dquote && !in_squote => {
+            ')' if !in_dquote && !in_squote && sub_depth > 0 => {
+                sub_depth -= 1;
+                cur.push(c);
+            }
+            c if c.is_whitespace() && !in_dquote && !in_squote && sub_depth == 0 => {
                 if !cur.is_empty() {
                     args.push(core::mem::take(&mut cur));
                     quoted.push(core::mem::take(&mut cur_q));
@@ -215,7 +228,14 @@ pub fn parse_pipeline(line: &str) -> Option<Pipeline> {
     let mut cur = String::new();
     let mut in_dquote = false;
     let mut in_squote = false;
+    let mut sub_depth = 0usize;
+    let mut prev_dollar = false;
     for c in line.chars() {
+        let opens_sub = prev_dollar && c == '(' && !in_dquote && !in_squote;
+        prev_dollar = c == '$' && !in_dquote && !in_squote;
+        if opens_sub {
+            sub_depth += 1;
+        }
         match c {
             '"' if !in_squote => {
                 in_dquote = !in_dquote;
@@ -225,7 +245,11 @@ pub fn parse_pipeline(line: &str) -> Option<Pipeline> {
                 in_squote = !in_squote;
                 cur.push(c);
             }
-            '|' if !in_dquote && !in_squote => {
+            ')' if !in_dquote && !in_squote && sub_depth > 0 => {
+                sub_depth -= 1;
+                cur.push(c);
+            }
+            '|' if !in_dquote && !in_squote && sub_depth == 0 => {
                 let t = cur.trim();
                 if !t.is_empty() {
                     segments.push(t.to_string());
@@ -254,7 +278,14 @@ pub fn split_semicolons(line: &str) -> Vec<String> {
     let mut cur = String::new();
     let mut in_dquote = false;
     let mut in_squote = false;
+    let mut sub_depth = 0usize;
+    let mut prev_dollar = false;
     for c in line.chars() {
+        let opens_sub = prev_dollar && c == '(' && !in_dquote && !in_squote;
+        prev_dollar = c == '$' && !in_dquote && !in_squote;
+        if opens_sub {
+            sub_depth += 1;
+        }
         match c {
             '"' if !in_squote => {
                 in_dquote = !in_dquote;
@@ -264,7 +295,11 @@ pub fn split_semicolons(line: &str) -> Vec<String> {
                 in_squote = !in_squote;
                 cur.push(c);
             }
-            ';' if !in_dquote && !in_squote => {
+            ')' if !in_dquote && !in_squote && sub_depth > 0 => {
+                sub_depth -= 1;
+                cur.push(c);
+            }
+            ';' if !in_dquote && !in_squote && sub_depth == 0 => {
                 let t = cur.trim();
                 if !t.is_empty() {
                     parts.push(t.to_string());
@@ -288,7 +323,14 @@ pub fn split_and(line: &str) -> Vec<String> {
     let mut in_dquote = false;
     let mut in_squote = false;
     let mut chars = line.chars().peekable();
+    let mut sub_depth = 0usize;
+    let mut prev_dollar = false;
     while let Some(c) = chars.next() {
+        let opens_sub = prev_dollar && c == '(' && !in_dquote && !in_squote;
+        prev_dollar = c == '$' && !in_dquote && !in_squote;
+        if opens_sub {
+            sub_depth += 1;
+        }
         match c {
             '"' if !in_squote => {
                 in_dquote = !in_dquote;
@@ -298,7 +340,11 @@ pub fn split_and(line: &str) -> Vec<String> {
                 in_squote = !in_squote;
                 cur.push(c);
             }
-            '&' if !in_dquote && !in_squote && chars.peek() == Some(&'&') => {
+            ')' if !in_dquote && !in_squote && sub_depth > 0 => {
+                sub_depth -= 1;
+                cur.push(c);
+            }
+            '&' if !in_dquote && !in_squote && sub_depth == 0 && chars.peek() == Some(&'&') => {
                 chars.next();
                 let t = cur.trim();
                 if !t.is_empty() {
@@ -344,7 +390,14 @@ pub fn split_or(line: &str) -> Vec<String> {
     let mut in_dquote = false;
     let mut in_squote = false;
     let mut chars = line.chars().peekable();
+    let mut sub_depth = 0usize;
+    let mut prev_dollar = false;
     while let Some(c) = chars.next() {
+        let opens_sub = prev_dollar && c == '(' && !in_dquote && !in_squote;
+        prev_dollar = c == '$' && !in_dquote && !in_squote;
+        if opens_sub {
+            sub_depth += 1;
+        }
         match c {
             '"' if !in_squote => {
                 in_dquote = !in_dquote;
@@ -354,7 +407,11 @@ pub fn split_or(line: &str) -> Vec<String> {
                 in_squote = !in_squote;
                 cur.push(c);
             }
-            '|' if !in_dquote && !in_squote && chars.peek() == Some(&'|') => {
+            ')' if !in_dquote && !in_squote && sub_depth > 0 => {
+                sub_depth -= 1;
+                cur.push(c);
+            }
+            '|' if !in_dquote && !in_squote && sub_depth == 0 && chars.peek() == Some(&'|') => {
                 chars.next();
                 let t = cur.trim();
                 if !t.is_empty() {
@@ -709,6 +766,9 @@ where
     /// the text-capture path; stages involving `launch`/`run` are wired
     /// with real kernel pipes (fd-to-fd, fully concurrent).
     pub fn execute_pipeline(&mut self, pipeline: &Pipeline) {
+        // An outer capture (from `$(...)`) steals the last stage's
+        // console output too; save it and merge at the end.
+        let outer_cap = self.capture.take();
         let cmds: Vec<Command> = pipeline
             .commands
             .iter()
@@ -716,6 +776,7 @@ where
             .collect();
         let n = cmds.len();
         if n == 0 {
+            self.capture = outer_cap;
             return;
         }
         // A launch stage can take a pipe on stdout unless it has its
@@ -791,8 +852,9 @@ where
                 }
             }
             // Builtins capture text for the next stage; launch status
-            // messages always go to the console.
-            if !last && !launch {
+            // messages always go to the console. Inside `$(...)` the
+            // last stage's output is captured as well.
+            if !launch && (!last || outer_cap.is_some()) {
                 self.capture = Some(String::new());
             }
             self.pipe_in_fd = in_fd;
@@ -825,7 +887,14 @@ where
             }
         }
         self.pending_stdin = None;
-        self.capture = None;
+        if let Some(mut outer) = outer_cap {
+            if let Some(last_txt) = self.capture.take() {
+                outer.push_str(&last_txt);
+            }
+            self.capture = Some(outer);
+        } else {
+            self.capture = None;
+        }
         for fd in shell_fds {
             let _ = self.fs.close(fd);
         }
@@ -896,33 +965,65 @@ where
         self.emit_raw(&format!("{}\n", s));
     }
 
-    /// Expand `$VAR` and `${VAR}` in command args using the shell env.
-    fn expand(&self, s: &str) -> String {
+    /// Expand `$VAR`, `${VAR}`, and `$(command)` in command args.
+    /// Command substitution runs the inner line through the full
+    /// executor and captures its output (trailing newlines stripped,
+    /// per POSIX).
+    fn expand(&mut self, s: &str) -> String {
+        let chars: Vec<char> = s.chars().collect();
         let mut out = String::new();
-        let mut chars = s.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c != '$' {
-                out.push(c);
+        let mut i = 0usize;
+        while i < chars.len() {
+            if chars[i] != '$' {
+                out.push(chars[i]);
+                i += 1;
                 continue;
             }
-            let name = if chars.peek() == Some(&'{') {
-                chars.next();
-                let mut n = String::new();
-                for c in chars.by_ref() {
-                    if c == '}' {
-                        break;
+            // `$( ... )` — find the matching close paren, skipping
+            // over quoted regions and nested substitutions.
+            if i + 1 < chars.len() && chars[i + 1] == '(' {
+                let mut depth = 1usize;
+                let mut j = i + 2;
+                let mut dq = false;
+                let mut sq = false;
+                while j < chars.len() && depth > 0 {
+                    match chars[j] {
+                        '"' if !sq => dq = !dq,
+                        '\'' if !dq => sq = !sq,
+                        '(' if !dq && !sq => depth += 1,
+                        ')' if !dq && !sq => depth -= 1,
+                        _ => {}
                     }
-                    n.push(c);
+                    j += 1;
                 }
+                if depth == 0 {
+                    let inner: String = chars[i + 2..j - 1].iter().collect();
+                    out.push_str(&self.subst_output(&inner));
+                    i = j;
+                    continue;
+                }
+                // Unbalanced: treat `$(` literally.
+                out.push('$');
+                i += 1;
+                continue;
+            }
+            let name = if i + 1 < chars.len() && chars[i + 1] == '{' {
+                let mut j = i + 2;
+                let mut n = String::new();
+                while j < chars.len() && chars[j] != '}' {
+                    n.push(chars[j]);
+                    j += 1;
+                }
+                i = j + 1;
                 n
             } else {
+                let mut j = i + 1;
                 let mut n = String::new();
-                while chars
-                    .peek()
-                    .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
-                {
-                    n.push(chars.next().unwrap());
+                while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                    n.push(chars[j]);
+                    j += 1;
                 }
+                i = j;
                 n
             };
             if name.is_empty() {
@@ -936,7 +1037,24 @@ where
         out
     }
 
-    fn expand_command(&self, cmd: Command) -> Command {
+    /// Run `line` capturing stdout text for `$(...)` substitution.
+    /// Saves/restores the capture buffer and last_ok so the inner
+    /// command doesn't disturb the outer command's state.
+    fn subst_output(&mut self, line: &str) -> String {
+        let saved_cap = self.capture.take();
+        let saved_ok = self.last_ok;
+        self.capture = Some(String::new());
+        self.execute(line);
+        let mut out = self.capture.take().unwrap_or_default();
+        while out.ends_with('\n') {
+            out.pop();
+        }
+        self.capture = saved_cap;
+        self.last_ok = saved_ok;
+        out
+    }
+
+    fn expand_command(&mut self, cmd: Command) -> Command {
         let mut args = Vec::new();
         let mut quoted = Vec::new();
         for (a, &q) in cmd.args.iter().zip(cmd.quoted.iter()) {
@@ -3576,5 +3694,28 @@ mod tests {
         assert!(o.contains("a       b"));
         // 8 leading spaces collapse to one tab
         assert!(o.contains("\tindented"));
+    }
+
+    #[test]
+    fn command_substitution() {
+        let (mut sh, out) = shell(&[
+            "echo $(echo hi)",
+            "echo x$(echo y)z",
+            "echo $(echo $(echo deep))",
+            "echo $(echo a; echo b)",
+            "echo $(echo x | cat)",
+            "echo '$(echo lit)'",
+            "echo \"$(echo dq)\"",
+            "exit",
+        ]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("> hi\n"), "OUT: {o}");
+        assert!(o.contains("> xyz\n"), "OUT: {o}");
+        assert!(o.contains("> deep\n"), "OUT: {o}");
+        assert!(o.contains("> a\nb\n"), "OUT: {o}");
+        assert!(o.contains("> x\n"), "OUT: {o}");
+        assert!(o.contains("> $(echo lit)\n"), "OUT: {o}");
+        assert!(o.contains("> dq\n"), "OUT: {o}");
     }
 }
