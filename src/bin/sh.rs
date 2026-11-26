@@ -129,8 +129,19 @@ impl Fs for SysFs {
         Some(String::from_utf8_lossy(&out).into_owned())
     }
 
-    // write_file/create_dir/remove_path keep trait defaults (unsupported):
-    // the initramfs VFS is read-only.
+    fn write_file(&self, path: &str, data: &str, append: bool) -> bool {
+        // Linux open(2) bits honored by the kernel: O_WRONLY=1,
+        // O_CREAT=0x40, O_TRUNC=0x200, O_APPEND=0x400.
+        let flags = 1 | 0x40 | if append { 0x400 } else { 0x200 };
+        let Ok(fd) = sys::api::open(path, flags) else {
+            return false;
+        };
+        let ok = sys::api::write(fd, data.as_bytes()).is_ok();
+        let _ = sys::api::close(fd);
+        ok
+    }
+
+    // create_dir/remove_path keep trait defaults (unsupported).
 
     fn cwd(&self) -> String {
         "/".to_string()
