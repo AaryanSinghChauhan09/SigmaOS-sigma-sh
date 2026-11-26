@@ -161,6 +161,15 @@ impl Fs for SysFs {
         sys::api::chdir(path).is_ok()
     }
 
+    fn open_write(&self, path: &str, append: bool) -> Option<i64> {
+        const O_WRONLY: u32 = 1;
+        const O_CREAT: u32 = 0x40;
+        const O_TRUNC: u32 = 0x200;
+        const O_APPEND: u32 = 0x400;
+        let flags = O_WRONLY | O_CREAT | if append { O_APPEND } else { O_TRUNC };
+        sys::api::open(path, flags).ok()
+    }
+
     fn cwd(&self) -> String {
         let mut buf = [0u8; 128];
         match sys::api::getcwd(&mut buf) {
@@ -226,12 +235,23 @@ impl System for SysSystem {
         let _ = sys::api::print("sh: reboot: no kernel reboot syscall\n");
     }
 
-    fn launch(&self, path: &str, args: &[String], env: &[String]) -> Result<i64, String> {
+    fn launch(
+        &self,
+        path: &str,
+        args: &[String],
+        env: &[String],
+        stdout_fd: i64,
+    ) -> Result<i64, String> {
         let arg_refs: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
         let env_refs: Vec<&[u8]> = env.iter().map(|e| e.as_bytes()).collect();
-        sys::api::spawn_args(path.as_bytes(), &arg_refs, &env_refs)
-            .map(|pid| pid as i64)
-            .map_err(|e| format!("spawn failed ({})", e))
+        sys::api::spawn_args(
+            path.as_bytes(),
+            &arg_refs,
+            &env_refs,
+            stdout_fd.max(0) as u64,
+        )
+        .map(|pid| pid as i64)
+        .map_err(|e| format!("spawn failed ({})", e))
     }
 
     fn wait(&self, pid: i64) -> Result<i64, String> {

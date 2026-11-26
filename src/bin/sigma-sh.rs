@@ -142,7 +142,13 @@ impl System for StdSys {
         let _ = Proc::new("systemctl").arg("reboot").status();
         let _ = Proc::new("reboot").status();
     }
-    fn launch(&self, path: &str, args: &[String], env: &[String]) -> Result<i64, String> {
+    fn launch(
+        &self,
+        path: &str,
+        args: &[String],
+        env: &[String],
+        _stdout_fd: i64,
+    ) -> Result<i64, String> {
         let p = if Path::new(path).is_absolute() {
             path.to_string()
         } else {

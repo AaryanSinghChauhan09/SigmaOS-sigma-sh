@@ -55,6 +55,11 @@ pub trait Fs {
     fn stat(&self, _path: &str) -> Option<(bool, u64)> {
         None
     }
+    /// Open a file for writing (create/truncate or append); returns an
+    /// fd usable as a child's stdout redirect. Default: unsupported.
+    fn open_write(&self, _path: &str, _append: bool) -> Option<i64> {
+        None
+    }
     /// Change the process working directory. Default: unsupported.
     fn chdir(&self, _path: &str) -> bool {
         false
@@ -80,7 +85,13 @@ pub trait System {
     /// Reboot the machine.
     fn reboot(&self);
     /// Spawn a program; returns pid or error string.
-    fn launch(&self, path: &str, args: &[String], env: &[String]) -> Result<i64, String>;
+    fn launch(
+        &self,
+        path: &str,
+        args: &[String],
+        env: &[String],
+        stdout_fd: i64,
+    ) -> Result<i64, String>;
     /// Wait for `pid` to exit; returns its exit status.
     /// Default: unsupported.
     fn wait(&self, _pid: i64) -> Result<i64, String> {
@@ -587,7 +598,7 @@ where
             args.pop();
         }
         let prev_redir = self.redirect.take();
-        if let Some(r) = redir {
+        if let Some(r) = redir.clone() {
             self.redirect = Some(r);
             self.redirect_initialized = false;
         }
@@ -633,7 +644,27 @@ where
             "mem" => self.cmd_mem(),
             "ps" => self.cmd_ps(),
             "time" | "uptime" => self.emit(&format_u64(self.sys.uptime())),
-            "launch" | "run" => self.cmd_launch(&args),
+            "launch" | "run" => {
+                // `launch prog > file`: open the target and hand its fd
+                // to the child as its stdout/stderr sink.
+                let fd = match &redir {
+                    Some((path, append)) => match self.fs.open_write(path, *append) {
+                        Some(fd) => fd,
+                        None => {
+                            self.emit(&format!("launch: {}: cannot open for write", path));
+                            self.last_ok = false;
+                            return;
+                        }
+                    },
+                    None => 0,
+                };
+                if redir.is_some() {
+                    // fd redirect replaces the emit redirect for launch;
+                    // prev_redir is restored at the end of this fn.
+                    self.redirect = None;
+                }
+                self.cmd_launch(&args, fd);
+            }
             "wait" => self.cmd_wait(&args),
             "reboot" => self.sys.reboot(),
             "jobs" => self.cmd_jobs(),
@@ -1316,7 +1347,7 @@ where
         }
     }
 
-    fn cmd_launch(&mut self, args: &[String]) {
+    fn cmd_launch(&mut self, args: &[String], stdout_fd: i64) {
         let Some(prog) = args.first() else {
             self.emit("launch: missing program");
             return;
@@ -1344,7 +1375,7 @@ where
             .iter()
             .map(|(k, v)| format!("{}={}", k, v))
             .collect();
-        match self.sys.launch(prog, &args[1..], &envp) {
+        match self.sys.launch(prog, &args[1..], &envp, stdout_fd) {
             Ok(pid) => {
                 self.last_pid = Some(pid);
                 if self.jobs.len() < 32 {
@@ -1598,7 +1629,13 @@ mod tests {
     }
     impl System for TestSys {
         fn reboot(&self) {}
-        fn launch(&self, path: &str, _args: &[String], _env: &[String]) -> Result<i64, String> {
+        fn launch(
+            &self,
+            path: &str,
+            _args: &[String],
+            _env: &[String],
+            _stdout_fd: i64,
+        ) -> Result<i64, String> {
             self.launched.borrow_mut().push(path.to_string());
             Ok(100)
         }
