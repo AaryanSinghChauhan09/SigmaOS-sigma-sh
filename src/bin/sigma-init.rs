@@ -76,9 +76,20 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
     sys::api::exit(101);
 }
 
-/// Process entry — the kernel jumps here with an empty user stack.
+/// Naked entry: align the kernel-provided RSP, then call so the
+/// callee sees ABI-correct post-call alignment.
+#[unsafe(naked)]
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "and rsp, -16",
+        "call {main}",
+        "ud2",
+        main = sym main_inner,
+    );
+}
+
+fn main_inner() -> ! {
     sys::arch::install();
     let _ = sys::api::print("sigma-init: PID 1 alive\n");
     let pid = sys::api::getpid().unwrap_or(-1);
@@ -92,28 +103,61 @@ pub extern "C" fn _start() -> ! {
             let _ = sys::api::print("spawned pid=");
             pdec(pid);
             let _ = sys::api::print("\n");
-            // Child is preemptively scheduled — WAIT may return
-            // EAGAIN until it exits; retry with a userspace spin
-            // (each retry is a syscall boundary the scheduler uses).
-            loop {
-                match sys::api::wait(pid) {
-                    Ok(code) => {
-                        let _ = sys::api::print("wait status=");
-                        pdec(code as u64);
-                        let _ = sys::api::print("\n");
-                        break;
-                    }
-                    Err(-11) => core::hint::spin_loop(), // EAGAIN: still running
-                    Err(e) => {
-                        perr(e);
-                        break;
-                    }
-                }
-            }
+            wait_exit(pid);
         }
         Err(e) => perr(e),
     }
+
+    // Prefer the full sigma-sh binary when the initramfs has /sh;
+    // fall back to the built-in mini-shell if it is absent or exits.
+    let _ = sys::api::print("init: spawning /sh\n");
+    match sys::api::spawn(b"/sh") {
+        Ok(pid) => {
+            let _ = sys::api::print("sh spawned pid=");
+            pdec(pid);
+            let _ = sys::api::print("\n");
+            wait_exit(pid);
+        }
+        Err(e) => {
+            let _ = sys::api::print("sh spawn failed ");
+            pdec(e as u64);
+            let _ = sys::api::print("\n");
+        }
+    }
     shell();
+}
+
+/// Wait for `pid` to exit, retrying on EAGAIN — the child is
+/// preemptively scheduled, so WAIT returns EAGAIN until it finishes.
+fn wait_exit(pid: u64) {
+    loop {
+        match sys::api::wait(pid) {
+            Ok(code) => {
+                let _ = sys::api::print("wait status=");
+                pdec(code as u64);
+                let _ = sys::api::print("\n");
+                break;
+            }
+            Err(-11) => core::hint::spin_loop(),
+            Err(e) => {
+                perr(e);
+                break;
+            }
+        }
+    }
+}
+
+/// Spawn `path` and wait for it to exit.
+fn spawn_and_wait(path: &[u8]) {
+    match sys::api::spawn(path) {
+        Ok(pid) => {
+            let _ = sys::api::print("spawned pid=");
+            pdec(pid);
+            let _ = sys::api::print("\n");
+            wait_exit(pid);
+        }
+        Err(e) => perr(e),
+    }
 }
 
 fn shell() -> ! {
@@ -154,8 +198,9 @@ fn run(cmd: &str) {
     let mut it = cmd.split_whitespace();
     match it.next() {
         Some("help") | None => {
-            let _ = sys::api::print("commands: ls <dir> | cat <file> | ver | time | mem | spawn [path] | wait <pid> | exit\n");
+            let _ = sys::api::print("commands: ls <dir> | cat <file> | ver | time | mem | spawn [path] | sh | wait <pid> | exit\n");
         }
+        Some("sh") => spawn_and_wait(b"/sh"),
         Some("ls") => {
             let path = it.next().unwrap_or("/");
             let mut buf = [0u8; 512];

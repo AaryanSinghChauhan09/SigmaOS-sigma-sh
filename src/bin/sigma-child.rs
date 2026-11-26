@@ -51,8 +51,18 @@ fn pdec(mut v: u64) {
     let _ = sys::api::write(1, &b[i..]);
 }
 
+#[unsafe(naked)]
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "and rsp, -16",
+        "call {main}",
+        "ud2",
+        main = sym main_inner,
+    );
+}
+
+fn main_inner() -> ! {
     sys::arch::install();
     let _ = sys::api::print("sigma-child: alive, pid=");
     pdec(sys::api::getpid().unwrap_or(0) as u64);

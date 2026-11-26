@@ -1,2 +1,2 @@
 [target.x86_64-unknown-none]
-rustflags = ["-C", "link-arg=-no-pie"]
+rustflags = ["-C", "link-arg=-no-pie", "-C", "link-arg=--image-base=0x600000"]

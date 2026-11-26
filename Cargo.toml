@@ -65,5 +65,11 @@ path = "src/bin/sigma-child.rs"
 test = false
 required-features = ["sigmaos-target"]
 
+[[bin]]
+name = "sh"
+path = "src/bin/sh.rs"
+test = false
+required-features = ["sigmaos-target"]
+
 [dependencies]
 sigmaos-sigma-sys = { path = "../SigmaOS-sigma-sys", features = ["x86_64"] }
