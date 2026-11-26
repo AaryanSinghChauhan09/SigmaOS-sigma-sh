@@ -1,6 +1,6 @@
 //! SigmaOS sigma-sh — minimal rescue shell.
 //!
-//! Builtins: help, ls, pwd, echo, cat, mem, ps, time, launch, reboot,
+//! Builtins: help, ls, pwd, echo, cat, which, mem, ps, time, launch, reboot,
 //! exit. I/O and filesystem access go through traits so the shell is
 //! fully testable on host and pluggable to sigma-sys at runtime.
 
@@ -190,6 +190,7 @@ where
             "pwd" => self.io.writeln(&self.cwd),
             "ls" => self.cmd_ls(&cmd.args),
             "cat" => self.cmd_cat(&cmd.args),
+            "which" => self.cmd_which(&cmd.args),
             "mem" => self.cmd_mem(),
             "ps" => self.cmd_ps(),
             "time" | "uptime" => self.io.writeln(&format_u64(self.sys.uptime())),
@@ -229,6 +230,7 @@ where
             "pwd" => self.io.writeln(&self.cwd),
             "ls" => self.cmd_ls(&cmd.args),
             "cat" => self.cmd_cat(&cmd.args),
+            "which" => self.cmd_which(&cmd.args),
             "mem" => self.cmd_mem(),
             "ps" => self.cmd_ps(),
             "time" | "uptime" => self.io.writeln(&format_u64(self.sys.uptime())),
@@ -251,6 +253,7 @@ where
             "  pwd             print working directory",
             "  echo <text>     print text",
             "  cat <file>      print file",
+            "  which <prog>    locate a program on PATH",
             "  mem             memory usage",
             "  ps              process list",
             "  time            uptime seconds",
@@ -304,6 +307,45 @@ where
             Some(s) => self.io.write(&s),
             None => self.io.writeln(&format!("cat: {}: no such file", path)),
         }
+    }
+
+    /// PATH search dirs for `which`, matching the sigmaos-target layout.
+    const WHICH_PATH: [&'static str; 4] = ["/bin", "/sbin", "/usr/bin", "/usr/sbin"];
+
+    fn cmd_which(&mut self, args: &[String]) {
+        let Some(name) = args.first() else {
+            self.io.writeln("which: missing program name");
+            return;
+        };
+        if name.contains('/') {
+            let path = if name.starts_with('/') {
+                name.clone()
+            } else {
+                format!("{}/{}", self.cwd, name)
+            };
+            let found = match path.rsplit_once('/') {
+                Some((dir, base)) => self
+                    .fs
+                    .list(dir)
+                    .is_some_and(|names| names.iter().any(|n| n == base)),
+                None => false,
+            };
+            if found {
+                self.io.writeln(&path);
+            } else {
+                self.io.writeln(&format!("which: no {} in {}", name, path));
+            }
+            return;
+        }
+        for dir in Self::WHICH_PATH {
+            if let Some(names) = self.fs.list(dir) {
+                if names.iter().any(|n| n == name) {
+                    self.io.writeln(&format!("{}/{}", dir, name));
+                    return;
+                }
+            }
+        }
+        self.io.writeln(&format!("which: no {} in PATH", name));
     }
 
     fn cmd_mem(&mut self) {
@@ -492,6 +534,22 @@ mod tests {
         let (mut sh, out) = shell(&["launch /bin/sh arg1", "exit"]);
         sh.run();
         assert!(out.borrow().contains("pid 100"));
+    }
+
+    #[test]
+    fn which_finds_on_path() {
+        let (mut sh, out) = shell(&[
+            "which sh",
+            "which missing",
+            "which /bin/sh",
+            "which /nope",
+            "exit",
+        ]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("/bin/sh"));
+        assert!(o.contains("which: no missing in PATH"));
+        assert!(o.contains("which: no /nope in /nope"));
     }
 
     #[test]
