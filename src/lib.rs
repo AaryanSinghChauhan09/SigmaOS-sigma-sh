@@ -1,7 +1,7 @@
 //! SigmaOS sigma-sh — minimal rescue shell.
 //!
 //! Builtins: help, ls, pwd, cd, echo, cat, which, history, export, unset,
-//! mem, ps, time, launch, reboot,
+//! mem, ps, time, launch, reboot, plus `*` glob expansion in arguments.
 //! exit. I/O and filesystem access go through traits so the shell is
 //! fully testable on host and pluggable to sigma-sys at runtime.
 
@@ -181,6 +181,27 @@ pub fn split_and(line: &str) -> Vec<String> {
         parts.push(t.to_string());
     }
     parts
+}
+
+/// Normalize `.`/`..` segments in an absolute path.
+fn normalize(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    if parts.is_empty() {
+        "/".to_string()
+    } else {
+        let mut p = String::from("/");
+        p.push_str(&parts.join("/"));
+        p
+    }
 }
 
 /// Split a line on `||` outside double quotes.
@@ -410,10 +431,53 @@ where
     }
 
     fn expand_command(&self, cmd: Command) -> Command {
+        let mut args = Vec::new();
+        for a in &cmd.args {
+            let expanded = self.expand(a);
+            if expanded.contains('*') {
+                args.extend(self.glob_expand(&expanded));
+            } else {
+                args.push(expanded);
+            }
+        }
         Command {
             name: cmd.name,
-            args: cmd.args.iter().map(|a| self.expand(a)).collect(),
+            args,
         }
+    }
+
+    /// Expand a `*` glob against the filesystem; unmatched patterns pass through.
+    fn glob_expand(&self, pat: &str) -> Vec<String> {
+        let (dir_raw, base) = match pat.rfind('/') {
+            Some(i) => (&pat[..=i], &pat[i + 1..]),
+            None => ("", pat),
+        };
+        let dir = if dir_raw.is_empty() {
+            format!("{}/", self.cwd)
+        } else if dir_raw.starts_with('/') {
+            dir_raw.to_string()
+        } else {
+            format!("{}/{}", self.cwd, dir_raw)
+        };
+        let dir = normalize(dir.trim_end_matches('/'));
+        let prefix = if dir == "/" {
+            String::from("/")
+        } else {
+            format!("{}/", dir)
+        };
+        let Some(names) = self.fs.list(&dir) else {
+            return alloc::vec![pat.to_string()];
+        };
+        let mut matches: Vec<String> = names
+            .iter()
+            .filter(|n| glob_match(base, n))
+            .map(|n| format!("{}{}", prefix, n))
+            .collect();
+        if matches.is_empty() {
+            return alloc::vec![pat.to_string()];
+        }
+        matches.sort();
+        matches
     }
 
     /// Execute a single command (helper for pipelines).
@@ -502,24 +566,7 @@ where
             },
             Some(a) => self.resolve(Some(a)),
         };
-        // Normalize "." and ".." segments.
-        let mut parts: Vec<&str> = Vec::new();
-        for seg in target.split('/') {
-            match seg {
-                "" | "." => {}
-                ".." => {
-                    parts.pop();
-                }
-                s => parts.push(s),
-            }
-        }
-        let norm = if parts.is_empty() {
-            "/".to_string()
-        } else {
-            let mut p = String::from("/");
-            p.push_str(&parts.join("/"));
-            p
-        };
+        let norm = normalize(&target);
         let is_back = args.first().is_some_and(|a| a == "-");
         match self.fs.list(&norm) {
             Some(_) => {
@@ -670,6 +717,35 @@ where
     fn cmd_bg(&mut self, _args: &[String]) {
         self.io.writeln("bg: job control not implemented");
     }
+}
+
+/// Match a glob pattern (`*` segments must appear in order).
+fn glob_match(pat: &str, name: &str) -> bool {
+    let segs: Vec<&str> = pat.split('*').collect();
+    if segs.len() == 1 {
+        return pat == name;
+    }
+    let mut rest = name;
+    for (i, seg) in segs.iter().enumerate() {
+        if seg.is_empty() {
+            continue;
+        }
+        match rest.find(seg) {
+            Some(pos) => {
+                if i == 0 && pos != 0 {
+                    return false;
+                }
+                rest = &rest[pos + seg.len()..];
+            }
+            None => return false,
+        }
+    }
+    if let Some(last) = segs.last() {
+        if !last.is_empty() && !name.ends_with(last) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Names dispatched by the shell (used for `&&` success tracking).
@@ -946,6 +1022,16 @@ mod tests {
         assert!(o.contains("bar"));
         assert!(o.contains("bar-baz"));
         assert!(o.contains("[]"));
+    }
+
+    #[test]
+    fn glob_expands() {
+        let (mut sh, out) = shell(&["echo /b*", "echo /*", "echo /zzz*", "exit"]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("/bin"));
+        assert!(o.contains("/bin /etc"));
+        assert!(o.contains("/zzz*")); // unmatched pattern passes through
     }
 
     #[test]
