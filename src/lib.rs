@@ -183,6 +183,36 @@ pub fn split_and(line: &str) -> Vec<String> {
     parts
 }
 
+/// Split a line on `||` outside double quotes.
+pub fn split_or(line: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                in_quote = !in_quote;
+                cur.push(c);
+            }
+            '|' if !in_quote && chars.peek() == Some(&'|') => {
+                chars.next();
+                let t = cur.trim();
+                if !t.is_empty() {
+                    parts.push(t.to_string());
+                }
+                cur.clear();
+            }
+            _ => cur.push(c),
+        }
+    }
+    let t = cur.trim();
+    if !t.is_empty() {
+        parts.push(t.to_string());
+    }
+    parts
+}
+
 /// The shell.
 pub struct Shell<I, F, P, M, S> {
     pub io: I,
@@ -251,6 +281,21 @@ where
                 if self.running {
                     self.execute(&part);
                 }
+            }
+            return;
+        }
+        // `||` runs the next command only if the previous failed.
+        let or_parts = split_or(line);
+        if or_parts.len() > 1 {
+            let mut first = true;
+            for part in or_parts {
+                if !self.running {
+                    break;
+                }
+                if first || !self.last_ok {
+                    self.execute(&part);
+                }
+                first = false;
             }
             return;
         }
@@ -862,6 +907,19 @@ mod tests {
         let o = out.borrow();
         assert!(!o.contains("should_not_print"));
         assert!(o.contains("yes"));
+    }
+
+    #[test]
+    fn or_or_runs_only_after_failure() {
+        let (mut sh, out) = shell(&[
+            "nosuchcmd || echo fallback",
+            "echo ok || echo skipped",
+            "exit",
+        ]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("fallback"));
+        assert!(!o.contains("skipped"));
     }
 
     #[test]
