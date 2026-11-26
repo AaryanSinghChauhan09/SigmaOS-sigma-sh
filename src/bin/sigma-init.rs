@@ -82,6 +82,8 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     core::arch::naked_asm!(
+        "mov rdi, [rsp]",
+        "lea rsi, [rsp + 8]",
         "and rsp, -16",
         "call {main}",
         "ud2",
@@ -89,7 +91,7 @@ pub extern "C" fn _start() -> ! {
     );
 }
 
-fn main_inner() -> ! {
+fn main_inner(_argc: u64, _argv: *const *const u8) -> ! {
     sys::arch::install();
     let _ = sys::api::print("sigma-init: PID 1 alive\n");
     let pid = sys::api::getpid().unwrap_or(-1);

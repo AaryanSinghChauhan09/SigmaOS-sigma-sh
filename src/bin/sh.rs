@@ -193,9 +193,9 @@ impl System for SysSystem {
         let _ = sys::api::print("sh: reboot: no kernel reboot syscall\n");
     }
 
-    fn launch(&self, path: &str, _args: &[String]) -> Result<i64, String> {
-        // SPAWN takes a path only (no argv yet); args are ignored.
-        sys::api::spawn(path.as_bytes())
+    fn launch(&self, path: &str, args: &[String]) -> Result<i64, String> {
+        let arg_refs: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
+        sys::api::spawn_args(path.as_bytes(), &arg_refs)
             .map(|pid| pid as i64)
             .map_err(|e| format!("spawn failed ({})", e))
     }
@@ -248,6 +248,8 @@ impl System for SysSystem {
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     core::arch::naked_asm!(
+        "mov rdi, [rsp]",
+        "lea rsi, [rsp + 8]",
         "and rsp, -16",
         "call {main}",
         "ud2",
@@ -255,7 +257,7 @@ pub extern "C" fn _start() -> ! {
     );
 }
 
-fn main_inner() -> ! {
+fn main_inner(_argc: u64, _argv: *const *const u8) -> ! {
     sys::arch::install();
     let mut shell = Shell::new(SysIo, SysFs, SysProcs, SysMem, SysSystem);
     shell.run();

@@ -5,6 +5,8 @@
 #![no_main]
 #![allow(static_mut_refs)]
 
+extern crate alloc;
+
 use core::alloc::{GlobalAlloc, Layout};
 use sigma_sys as sys;
 
@@ -55,6 +57,8 @@ fn pdec(mut v: u64) {
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     core::arch::naked_asm!(
+        "mov rdi, [rsp]",
+        "lea rsi, [rsp + 8]",
         "and rsp, -16",
         "call {main}",
         "ud2",
@@ -62,10 +66,28 @@ pub extern "C" fn _start() -> ! {
     );
 }
 
-fn main_inner() -> ! {
+fn main_inner(argc: u64, argv: *const *const u8) -> ! {
     sys::arch::install();
     let _ = sys::api::print("sigma-child: alive, pid=");
     pdec(sys::api::getpid().unwrap_or(0) as u64);
+    let _ = sys::api::print(", argc=");
+    pdec(argc);
+    if !argv.is_null() {
+        for i in 0..argc as usize {
+            let p = unsafe { *argv.add(i) };
+            if !p.is_null() {
+                let mut s = alloc::string::String::new();
+                unsafe {
+                    let mut q = p;
+                    while *q != 0 && s.len() < 64 {
+                        s.push(*q as char);
+                        q = q.add(1);
+                    }
+                }
+                let _ = sys::api::print(&alloc::format!(" arg{}={}", i, s));
+            }
+        }
+    }
     let _ = sys::api::print("\n");
     // Spin for a while so the timer IRQ preempts us and the parent
     // gets scheduled — demonstrates preemptive context switching.
