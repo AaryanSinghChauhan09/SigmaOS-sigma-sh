@@ -143,6 +143,11 @@ pub trait System {
 pub struct Command {
     pub name: String,
     pub args: Vec<String>,
+    /// Per-arg quote mask parallel to `args`: bit0 = the arg
+    /// contained a single-quoted section, bit1 = double-quoted.
+    /// Single quotes suppress `$` expansion and globbing; double
+    /// quotes suppress globbing only (POSIX).
+    pub quoted: Vec<u8>,
 }
 
 /// A pipeline of commands connected by pipes.
@@ -172,16 +177,25 @@ pub fn parse(line: &str) -> Option<Command> {
         return None;
     }
     let mut args = Vec::new();
+    let mut quoted = Vec::new();
     let mut cur = String::new();
+    let mut cur_q: u8 = 0;
     let mut in_dquote = false;
     let mut in_squote = false;
     for c in chars {
         match c {
-            '"' if !in_squote => in_dquote = !in_dquote,
-            '\'' if !in_dquote => in_squote = !in_squote,
+            '"' if !in_squote => {
+                in_dquote = !in_dquote;
+                cur_q |= 2;
+            }
+            '\'' if !in_dquote => {
+                in_squote = !in_squote;
+                cur_q |= 1;
+            }
             c if c.is_whitespace() && !in_dquote && !in_squote => {
                 if !cur.is_empty() {
                     args.push(core::mem::take(&mut cur));
+                    quoted.push(core::mem::take(&mut cur_q));
                 }
             }
             _ => cur.push(c),
@@ -189,8 +203,9 @@ pub fn parse(line: &str) -> Option<Command> {
     }
     if !cur.is_empty() {
         args.push(cur);
+        quoted.push(cur_q);
     }
-    Some(Command { name, args })
+    Some(Command { name, args, quoted })
 }
 
 /// Split a pipeline on `|` outside quotes. `||` was already handled
@@ -923,17 +938,32 @@ where
 
     fn expand_command(&self, cmd: Command) -> Command {
         let mut args = Vec::new();
-        for a in &cmd.args {
+        let mut quoted = Vec::new();
+        for (a, &q) in cmd.args.iter().zip(cmd.quoted.iter()) {
+            // Single-quoted sections are fully literal: no $ expansion,
+            // no globbing.
+            if q & 1 != 0 {
+                args.push(a.clone());
+                quoted.push(q);
+                continue;
+            }
             let expanded = self.expand(a);
-            if expanded.contains('*') {
-                args.extend(self.glob_expand(&expanded));
+            // Double quotes (and mixed) suppress globbing; unquoted
+            // args glob on `*`.
+            if q & 2 == 0 && expanded.contains('*') {
+                for m in self.glob_expand(&expanded) {
+                    args.push(m);
+                    quoted.push(0);
+                }
             } else {
                 args.push(expanded);
+                quoted.push(q);
             }
         }
         Command {
             name: cmd.name,
             args,
+            quoted,
         }
     }
 
@@ -3003,6 +3033,27 @@ mod tests {
         assert!(o.contains("/bin"));
         assert!(o.contains("/bin /etc"));
         assert!(o.contains("/zzz*")); // unmatched pattern passes through
+    }
+
+    #[test]
+    fn quotes_suppress_expansion() {
+        let (mut sh, out) = shell(&[
+            "export FOO=bar",
+            "echo $FOO",     // unquoted: expands
+            "echo '$FOO'",   // single: literal
+            "echo \"$FOO\"", // double: expands
+            "echo '/b*'",    // single: no glob
+            "echo \"/b*\"",  // double: no glob
+            "exit",
+        ]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("> bar\n"));
+        assert!(o.contains("$FOO"));
+        // '/b*' and "/b*" both print literally, never /bin
+        assert!(!o.contains("/bin /etc\n/b*"));
+        let literal_count = o.matches("/b*").count();
+        assert_eq!(literal_count, 2, "both quoted globs stay literal");
     }
 
     #[test]
