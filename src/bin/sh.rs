@@ -314,19 +314,22 @@ impl System for SysSystem {
     }
 
     fn kill(&self, pid: i64, sig: &str) -> bool {
-        let code = sig.parse::<i64>().unwrap_or(match sig {
+        // Fatal-by-default set — must match the kernel's FATAL table.
+        let code = match sig {
             "HUP" => 1,
             "INT" => 2,
             "QUIT" => 3,
+            "ABRT" => 6,
             "KILL" => 9,
             "USR1" => 10,
-            "SEGV" => 11,
             "USR2" => 12,
+            "ALRM" => 14,
             "TERM" => 15,
-            "STOP" => 19,
-            "CONT" => 18,
-            _ => 15,
-        });
+            _ => match sig.parse::<i64>() {
+                Ok(n) if (1..=15).contains(&n) => n,
+                _ => return false,
+            },
+        };
         sys::api::kill(pid, code).is_ok()
     }
 

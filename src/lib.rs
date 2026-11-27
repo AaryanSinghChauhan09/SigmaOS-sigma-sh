@@ -1513,6 +1513,10 @@ pub struct Shell<I, F, P, M, S> {
     pub last_pid: Option<i64>,
     /// Launched jobs: (pid, command line, reaped flag).
     pub jobs: Vec<(i64, String, bool)>,
+    /// Command run by `trap ... EXIT` when the shell exits.
+    pub exit_trap: Option<String>,
+    /// Reentrancy guard for run_exit_trap.
+    pub in_exit_trap: bool,
     /// Pipe fd to use as the next launch stage's stdin (0 = none).
     pub pipe_in_fd: i64,
     /// Pipe fd to use as the next launch stage's stdout (0 = none).
@@ -1576,6 +1580,8 @@ where
             pending_stdin: None,
             last_pid: None,
             jobs: Vec::new(),
+            exit_trap: None,
+            in_exit_trap: false,
             pipe_in_fd: 0,
             pipe_out_fd: 0,
             running: true,
@@ -1602,6 +1608,7 @@ where
         while self.running {
             self.io.write("sigma> ");
             let Some(line) = self.io.read_line() else {
+                self.run_exit_trap();
                 break;
             };
             if self.history.len() >= 100 {
@@ -2429,7 +2436,10 @@ where
         } {
             "\u{7}fn" => self.call_function(&cmd.name, &args),
             "help" | "?" => self.cmd_help(),
-            "exit" | "logout" | "quit" => self.running = false,
+            "exit" | "logout" | "quit" => {
+                self.run_exit_trap();
+                self.running = false;
+            }
             "true" | ":" => {}
             "false" => self.last_ok = false,
             "clear" => self.io.write("\x1b[2J\x1b[H"),
@@ -2484,6 +2494,7 @@ where
             "sleep" => self.cmd_sleep(&args),
             "read" => self.cmd_read(&args),
             "kill" => self.cmd_kill(&args),
+            "trap" => self.cmd_trap(&args),
             "fork" => self.cmd_fork(),
             "exec" => self.cmd_exec(&args),
             "uname" => self.cmd_uname(&args),
@@ -4575,6 +4586,13 @@ where
     }
 
     fn cmd_kill(&mut self, args: &[String]) {
+        // `kill -l` — list the fatal-by-default signals.
+        if args.first().is_some_and(|a| a == "-l" || a == "-L") {
+            for (n, name) in SIGNAL_NAMES {
+                self.emit(&format!("{:2}) SIG{}", n, name));
+            }
+            return;
+        }
         // `kill [-SIG] pid` — first dash-arg selects the signal
         // ("-9", "-KILL", "-SIGTERM"), default SIGTERM.
         let mut sig = String::from("TERM");
@@ -4600,6 +4618,43 @@ where
                 self.last_ok = false;
                 self.emit(&format!("kill: {}: no such process", p));
             }
+        }
+    }
+
+    /// `trap ACTION EXIT` — run ACTION when the shell exits.
+    /// Signal traps aren't supported yet (no user handler delivery);
+    /// only EXIT/0 is accepted. `trap` lists, `trap - EXIT` resets.
+    fn cmd_trap(&mut self, args: &[String]) {
+        if args.is_empty() {
+            match &self.exit_trap {
+                Some(c) => self.emit(&format!("trap -- '{}' EXIT", c)),
+                None => self.emit("trap: no traps set"),
+            }
+            return;
+        }
+        let sig = args.get(1).map(String::as_str).unwrap_or("EXIT");
+        if sig != "EXIT" && sig != "0" {
+            self.emit("trap: only EXIT is supported (signal delivery pending)");
+            self.last_ok = false;
+            return;
+        }
+        match args[0].as_str() {
+            "-" => self.exit_trap = None,
+            "" => {}
+            cmd => self.exit_trap = Some(cmd.to_string()),
+        }
+    }
+
+    /// Run the EXIT trap once, if set. Reentrancy-guarded so a trap
+    /// command that itself exits can't recurse.
+    fn run_exit_trap(&mut self) {
+        if self.in_exit_trap {
+            return;
+        }
+        if let Some(cmd) = self.exit_trap.take() {
+            self.in_exit_trap = true;
+            self.execute(&cmd);
+            self.in_exit_trap = false;
         }
     }
 
@@ -4906,7 +4961,7 @@ where
     fn cmd_wait(&mut self, args: &[String]) {
         if args.is_empty() {
             if let Ok(status) = self.sys.wait_any() {
-                self.emit(&format!("wait: child exited {}", status));
+                self.emit(&format!("wait: {}", wait_status_text(None, status)));
                 return;
             }
         }
@@ -4935,7 +4990,7 @@ where
                         j.2 = true;
                     }
                 }
-                self.emit(&format!("wait: pid {} exited {}", pid, status));
+                self.emit(&format!("wait: {}", wait_status_text(Some(pid), status)));
             }
             Err(e) => {
                 self.emit(&format!("wait: {}: {}", pid, e));
@@ -5068,8 +5123,22 @@ const BUILTIN_NAMES: &[&str] = &[
     "logout", "ls", "mem", "mkdir", "mount", "mv", "nl", "nproc", "od", "paste", "popd",
     "printenv", "printf", "ps", "pushd", "pwd", "quit", "read", "readonly", "reboot", "return",
     "rm", "rmdir", "run", "seq", "set", "shift", "sleep", "sort", "source", "tail", "tee", "test",
-    "time", "times", "touch", "tr", "true", "tty", "umount", "unalias", "uname", "unexpand",
-    "uniq", "unset", "uptime", "wait", "wc", "which", "whoami", "xargs", "yes",
+    "time", "times", "touch", "tr", "true", "tty", "trap", "umount", "unalias", "uname",
+    "unexpand", "uniq", "unset", "uptime", "wait", "wc", "which", "whoami", "xargs", "yes",
+];
+
+/// Fatal-by-default signals the kernel delivers (POSIX numbers) —
+/// matches `sys_kill`'s FATAL table in sigma-kernel.
+const SIGNAL_NAMES: &[(u64, &str)] = &[
+    (1, "HUP"),
+    (2, "INT"),
+    (3, "QUIT"),
+    (6, "ABRT"),
+    (9, "KILL"),
+    (10, "USR1"),
+    (12, "USR2"),
+    (14, "ALRM"),
+    (15, "TERM"),
 ];
 
 /// Kernel FsKind code -> display name (1=initramfs, 2=fat32, 4=proc).
@@ -5079,6 +5148,28 @@ fn fs_kind_name(kind: u64) -> &'static str {
         2 => "fat32",
         4 => "proc",
         _ => "other",
+    }
+}
+
+/// Format a wait status: exit codes print plainly; statuses in the
+/// 128+sig range decode to the signal name (kernel kill convention).
+fn wait_status_text(pid: Option<i64>, status: i64) -> String {
+    let sig = status - 128;
+    if status > 128 && SIGNAL_NAMES.iter().any(|(n, _)| *n == sig as u64) {
+        let name = SIGNAL_NAMES
+            .iter()
+            .find(|(n, _)| *n == sig as u64)
+            .map(|(_, s)| *s)
+            .unwrap_or("?");
+        match pid {
+            Some(p) => format!("pid {} terminated by SIG{}", p, name),
+            None => format!("child terminated by SIG{}", name),
+        }
+    } else {
+        match pid {
+            Some(p) => format!("pid {} exited {}", p, status),
+            None => format!("child exited {}", status),
+        }
     }
 }
 
@@ -6366,6 +6457,23 @@ mod tests {
         sh.run();
         let o = out.borrow();
         assert!(o.contains("fork: unsupported"), "OUT: {o}");
+    }
+
+    #[test]
+    fn trap_exit_runs_on_exit() {
+        let (mut sh, out) = shell(&["trap 'echo bye-trap' EXIT", "exit"]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("bye-trap"), "OUT: {o}");
+    }
+
+    #[test]
+    fn trap_signal_names_rejected() {
+        let (mut sh, out) = shell(&["trap 'echo x' INT", "exit"]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("only EXIT"), "OUT: {o}");
+        assert!(!o.contains("\nx\n"), "OUT: {o}");
     }
 
     #[test]
