@@ -1266,6 +1266,11 @@ pub struct Shell<I, F, P, M, S> {
     /// `while read` loops consume a pipe line-by-line. Reset at
     /// pipeline boundaries; `Some("")` marks EOF.
     pub stdin_rest: Option<String>,
+    /// Variable names marked `readonly` — assignments fail.
+    pub readonly_vars: Vec<String>,
+    /// Per-function `local` saves: (name, previous value). Popped and
+    /// restored when the function returns.
+    pub local_stack: Vec<Vec<(String, Option<String>)>>,
 }
 
 impl<I, F, P, M, S> Shell<I, F, P, M, S>
@@ -1307,6 +1312,8 @@ where
             brk_flag: false,
             cont_flag: false,
             stdin_rest: None,
+            readonly_vars: Vec::new(),
+            local_stack: Vec::new(),
         }
     }
 
@@ -2244,6 +2251,8 @@ where
                 self.params.drain(..n);
             }
             "command" => self.cmd_command(&args),
+            "readonly" => self.cmd_readonly(&args),
+            "local" => self.cmd_local(&args),
             "break" => {
                 if self.loop_depth == 0 {
                     self.last_ok = false;
@@ -2417,13 +2426,8 @@ where
         }
         for (k, v) in pairs {
             let v = self.expand(&v);
-            if let Some(e) = self.env.iter_mut().find(|(ek, _)| *ek == k) {
-                e.1 = v;
-            } else {
-                self.env.push((k, v));
-            }
+            self.set_var(&k, &v);
         }
-        self.last_ok = true;
         true
     }
 
@@ -2538,10 +2542,26 @@ where
         self.params = fargs.to_vec();
         self.fn_depth += 1;
         self.ret_flag = false;
+        self.local_stack.push(Vec::new());
         self.execute(&body);
         self.fn_depth -= 1;
         self.ret_flag = false;
         self.params = saved_params;
+        // Restore `local` variables to their pre-call values.
+        if let Some(saved) = self.local_stack.pop() {
+            for (k, old) in saved {
+                match old {
+                    Some(v) => {
+                        if let Some(e) = self.env.iter_mut().find(|(ek, _)| *ek == k) {
+                            e.1 = v;
+                        } else {
+                            self.env.push((k, v));
+                        }
+                    }
+                    None => self.env.retain(|(ek, _)| *ek != k),
+                }
+            }
+        }
     }
 
     fn cmd_help(&mut self) {
@@ -2776,6 +2796,11 @@ where
         for a in args {
             match a.split_once('=') {
                 Some((k, v)) if !k.is_empty() => {
+                    if self.readonly_vars.iter().any(|r| r == k) {
+                        self.last_ok = false;
+                        self.emit(&format!("{}: readonly variable", k));
+                        continue;
+                    }
                     if let Some(e) = self.env.iter_mut().find(|(ek, _)| ek == k) {
                         e.1 = v.to_string();
                     } else {
@@ -3750,8 +3775,75 @@ where
         }
     }
 
-    /// Upsert a shell variable in `env`.
+    /// `readonly [NAME[=value]...]` — mark vars immutable; `NAME=value`
+    /// assigns first. No args lists readonly names.
+    fn cmd_readonly(&mut self, args: &[String]) {
+        if args.is_empty() {
+            for r in self.readonly_vars.clone() {
+                self.emit(&r);
+            }
+            return;
+        }
+        for a in args {
+            let (k, v) = match a.split_once('=') {
+                Some((k, v)) => (k, Some(v.to_string())),
+                None => (a.as_str(), None),
+            };
+            if k.is_empty() {
+                self.last_ok = false;
+                self.emit(&format!("readonly: {}: not a valid name", a));
+                continue;
+            }
+            if self.readonly_vars.iter().any(|r| r == k) {
+                self.last_ok = false;
+                self.emit(&format!("{}: readonly variable", k));
+                continue;
+            }
+            if let Some(v) = v {
+                self.set_var(k, &v);
+            }
+            self.readonly_vars.push(k.to_string());
+        }
+    }
+
+    /// `local NAME[=value]...` — function-scoped vars, restored on
+    /// return. Only valid inside a function body.
+    fn cmd_local(&mut self, args: &[String]) {
+        if self.fn_depth == 0 {
+            self.last_ok = false;
+            self.emit("local: can only be used in a function");
+            return;
+        }
+        let mut saved = Vec::new();
+        for a in args {
+            let (k, v) = match a.split_once('=') {
+                Some((k, v)) => (k, v.to_string()),
+                None => (a.as_str(), String::new()),
+            };
+            let ok = !k.is_empty()
+                && k.chars().enumerate().all(|(i, c)| {
+                    c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit())
+                });
+            if !ok {
+                self.last_ok = false;
+                self.emit(&format!("local: {}: not a valid name", a));
+                continue;
+            }
+            saved.push((k.to_string(), self.var_value(k)));
+            self.set_var(k, &v);
+        }
+        if let Some(frame) = self.local_stack.last_mut() {
+            frame.extend(saved);
+        }
+    }
+
+    /// Upsert a shell variable in `env`. Fails on `readonly` names.
     fn set_var(&mut self, k: &str, v: &str) {
+        if self.readonly_vars.iter().any(|r| r == k) {
+            self.last_ok = false;
+            self.emit(&format!("{}: readonly variable", k));
+            return;
+        }
         if let Some(e) = self.env.iter_mut().find(|(ek, _)| ek == k) {
             e.1 = v.to_string();
         } else {
@@ -3871,6 +3963,11 @@ where
 
     fn cmd_unset(&mut self, args: &[String]) {
         for a in args {
+            if self.readonly_vars.iter().any(|r| r == a) {
+                self.last_ok = false;
+                self.emit(&format!("{}: readonly variable", a));
+                continue;
+            }
             self.env.retain(|(k, _)| k != a);
         }
     }
@@ -5214,5 +5311,29 @@ mod tests {
         for want in ["a/b/c.txt c.txt", "b/c.txt c.txt", "foo.tar foo tar.gz"] {
             assert!(o.contains(want), "missing {want} OUT: {o}");
         }
+    }
+
+    #[test]
+    fn readonly_and_local() {
+        let (mut sh, out) = shell(&[
+            "ro=1",
+            "readonly ro",
+            "ro=2",
+            "echo still-$ro",
+            "unset ro",
+            "f() { local tmp=inner; echo in-$tmp; }",
+            "tmp=outer",
+            "f",
+            "echo out-$tmp",
+            "local x",
+            "exit",
+        ]);
+        sh.run();
+        let o = out.borrow();
+        for want in ["still-1", "in-inner", "out-outer"] {
+            assert!(o.contains(want), "missing {want} OUT: {o}");
+        }
+        assert!(o.contains("readonly variable"), "OUT: {o}");
+        assert!(o.contains("can only be used in a function"), "OUT: {o}");
     }
 }
