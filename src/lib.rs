@@ -2224,6 +2224,13 @@ where
             "fork" => self.cmd_fork(),
             "exec" => self.cmd_exec(&args),
             "uname" => self.cmd_uname(&args),
+            "printenv" => self.cmd_printenv(&args),
+            "set" => self.cmd_set(&args),
+            "id" => self.emit("uid=0(root) gid=0(root) groups=0(root)"),
+            "whoami" => self.emit("root"),
+            "groups" => self.emit("root"),
+            "tty" => self.emit("/dev/console"),
+            "yes" => self.cmd_yes(&args),
             "dmesg" => self.cmd_dmesg(),
             "arch" => self.emit("x86_64"),
             "hostname" => self.cmd_hostname(&args),
@@ -3901,6 +3908,51 @@ where
             return;
         }
         self.emit(&parts.join(" "));
+    }
+
+    /// `printenv [NAME]` — print env values (no `NAME=` prefix).
+    fn cmd_printenv(&mut self, args: &[String]) {
+        if let Some(name) = args.first() {
+            let val = self
+                .env
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone());
+            match val {
+                Some(v) => self.emit(&v),
+                None => self.last_ok = false,
+            }
+            return;
+        }
+        // Bare `printenv` prints NAME=value pairs like `env`.
+        for (k, v) in self.env.clone() {
+            self.emit(&format!("{}={}", k, v));
+        }
+    }
+
+    /// `set` — no args prints all variables (POSIX `set`/`export -p`).
+    /// Options like `-e`/`-x` are accepted silently for script compat.
+    fn cmd_set(&mut self, args: &[String]) {
+        if !args.is_empty() && !args.iter().all(|a| a.starts_with('-')) {
+            self.emit("set: positional parameters not supported");
+            self.last_ok = false;
+            return;
+        }
+        for (k, v) in self.env.clone() {
+            self.emit(&format!("{}={}", k, v));
+        }
+    }
+
+    /// `yes [STRING...]` — print STRING (default "y") forever.
+    fn cmd_yes(&mut self, args: &[String]) {
+        let s = if args.is_empty() {
+            "y".to_string()
+        } else {
+            args.join(" ")
+        };
+        loop {
+            self.emit(&s);
+        }
     }
 
     /// `dmesg` — print the kernel ring buffer.
