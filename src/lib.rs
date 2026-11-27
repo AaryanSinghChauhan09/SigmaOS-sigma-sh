@@ -529,6 +529,88 @@ fn arith_eval(expr: &str, env: &[(String, String)]) -> String {
     p.expr().to_string()
 }
 
+/// Strip one layer of matching surrounding single/double quotes.
+fn unquote(s: &str) -> String {
+    let t = s.trim();
+    let b: Vec<char> = t.chars().collect();
+    if b.len() >= 2
+        && ((b[0] == '"' && b[b.len() - 1] == '"') || (b[0] == '\'' && b[b.len() - 1] == '\''))
+    {
+        return b[1..b.len() - 1].iter().collect();
+    }
+    t.to_string()
+}
+
+/// Split case patterns on `|` outside quotes.
+fn split_case_pats(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_d = false;
+    let mut in_s = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if !in_s => {
+                in_d = !in_d;
+                cur.push(c);
+            }
+            '\'' if !in_d => {
+                in_s = !in_s;
+                cur.push(c);
+            }
+            '|' if !in_d && !in_s => {
+                out.push(core::mem::take(&mut cur));
+            }
+            _ => cur.push(c),
+        }
+    }
+    out.push(cur);
+    out
+}
+
+/// Split on `;;` outside quotes and substitution parens.
+fn split_double_semis(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_d = false;
+    let mut in_s = false;
+    let mut depth = 0usize;
+    let mut prev_dollar = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        let opens_sub = prev_dollar && c == '(' && !in_d && !in_s;
+        prev_dollar = c == '$' && !in_d && !in_s;
+        if opens_sub {
+            depth += 1;
+        }
+        match c {
+            '"' if !in_s => {
+                in_d = !in_d;
+                cur.push(c);
+            }
+            '\'' if !in_d => {
+                in_s = !in_s;
+                cur.push(c);
+            }
+            '(' if !in_d && !in_s && depth > 0 && !opens_sub => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' if !in_d && !in_s && depth > 0 => {
+                depth -= 1;
+                cur.push(c);
+            }
+            ';' if !in_d && !in_s && depth == 0 && chars.peek() == Some(&';') => {
+                chars.next();
+                out.push(core::mem::take(&mut cur));
+            }
+            _ => cur.push(c),
+        }
+    }
+    out.push(cur);
+    out
+}
+
 /// Quote-aware word split for `for ... in` item lists. Returns
 /// (word, quoted-mask) pairs; quotes are stripped.
 fn split_items(s: &str) -> Vec<String> {
@@ -1167,6 +1249,12 @@ where
         }
         // Whole-line `VAR=value [VAR2=value2 ...]` assignments.
         if self.try_assignments(line) {
+            return;
+        }
+        // `case WORD in ... esac` — dedicated parser (`)`/`;;`
+        // delimiters don't map onto the keyword tokens).
+        if line.split_whitespace().next() == Some("case") {
+            self.exec_case(line);
             return;
         }
         // Compound commands: `if/for/while/until` opening a `;`-list.
@@ -1957,6 +2045,105 @@ where
         self.in_command = true;
         self.execute_single_command(&c);
         self.in_command = false;
+    }
+
+    /// `case WORD in pat[|pat]) LIST ;; ... esac` — single-line form.
+    /// Patterns support `*`/`?`-style globbing via `glob_match`.
+    fn exec_case(&mut self, line: &str) {
+        let rest = line.trim_start()["case".len()..].trim_start();
+        // Split `WORD in` from the arm list: find a standalone `in`
+        // outside quotes and substitution parens.
+        let bytes: Vec<char> = rest.chars().collect();
+        let mut i = 0usize;
+        let mut in_d = false;
+        let mut in_s = false;
+        let mut depth = 0usize;
+        let mut split_at = None;
+        while i < bytes.len() {
+            let c = bytes[i];
+            match c {
+                '"' if !in_s => in_d = !in_d,
+                '\'' if !in_d => in_s = !in_s,
+                '(' if !in_d && !in_s => depth += 1,
+                ')' if !in_d && !in_s && depth > 0 => depth -= 1,
+                'i' if !in_d
+                    && !in_s
+                    && depth == 0
+                    && i > 0
+                    && bytes[i - 1].is_whitespace()
+                    && bytes.get(i + 1) == Some(&'n')
+                    && bytes.get(i + 2).is_some_and(|c| c.is_whitespace()) =>
+                {
+                    split_at = Some((i - 1, i + 3));
+                    break;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let Some((w_end, a_start)) = split_at else {
+            self.last_ok = false;
+            self.emit("case: syntax error (expected `in`)");
+            return;
+        };
+        let word_raw: String = bytes[..w_end].iter().collect();
+        let arms_src: String = bytes[a_start..].iter().collect();
+        // Require trailing `esac` as the last word.
+        let trimmed = arms_src.trim_end();
+        let has_esac = trimmed == "esac"
+            || (trimmed.ends_with("esac")
+                && trimmed[..trimmed.len() - 4].ends_with(|c: char| c.is_whitespace()));
+        if !has_esac {
+            self.last_ok = false;
+            self.emit("case: syntax error (expected `esac`)");
+            return;
+        }
+        let arms_src = &trimmed[..trimmed.len() - 4];
+        let word = self.expand(word_raw.trim());
+        let word = unquote(&word);
+        self.last_ok = true;
+        // Split arms on `;;` outside quotes/parens.
+        for seg in split_double_semis(arms_src) {
+            let seg = seg.trim();
+            if seg.is_empty() {
+                continue;
+            }
+            // First `)` outside quotes ends the pattern list.
+            let pb: Vec<char> = seg.chars().collect();
+            let mut j = 0usize;
+            let mut pd = false;
+            let mut ps = false;
+            let mut close = None;
+            while j < pb.len() {
+                match pb[j] {
+                    '"' if !ps => pd = !pd,
+                    '\'' if !pd => ps = !ps,
+                    ')' if !pd && !ps => {
+                        close = Some(j);
+                        break;
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            let Some(cp) = close else {
+                self.last_ok = false;
+                self.emit("case: syntax error (missing `)`)");
+                return;
+            };
+            let pat_src: String = pb[..cp].iter().collect();
+            let body: String = pb[cp + 1..].iter().collect();
+            let matched = split_case_pats(&pat_src)
+                .iter()
+                .any(|p| glob_match(&unquote(p.trim()), &word));
+            if matched {
+                let body = body.trim();
+                if !body.is_empty() {
+                    self.execute(body);
+                }
+                return;
+            }
+        }
     }
 
     /// If `line` consists solely of `NAME=value` words, set the env
@@ -4624,5 +4811,26 @@ mod tests {
             assert!(o.contains(want), "missing {want} OUT: {o}");
         }
         assert!(!o.contains("n=3"), "OUT: {o}");
+    }
+
+    #[test]
+    fn case_statement() {
+        let (mut sh, out) = shell(&[
+            "case a in a) echo first ;; b) echo second ;; esac",
+            "case b in a) echo first ;; b) echo second ;; esac",
+            "case z in a) echo first ;; *) echo star ;; esac",
+            "case foo in f*) echo f-match ;; esac",
+            "x=mid",
+            "case $x in a|m*) echo hit-$x ;; esac",
+            "case q in a) echo no-match ;; esac",
+            "echo after",
+            "exit",
+        ]);
+        sh.run();
+        let o = out.borrow();
+        for want in ["first", "second", "star", "f-match", "hit-mid", "after"] {
+            assert!(o.contains(want), "missing {want} OUT: {o}");
+        }
+        assert!(!o.contains("no-match"), "OUT: {o}");
     }
 }
