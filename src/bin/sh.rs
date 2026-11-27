@@ -340,6 +340,14 @@ impl System for SysSystem {
             .map(|v| v.to_string())
             .unwrap_or_else(|_| "unknown".into())
     }
+
+    fn dmesg(&self) -> Option<String> {
+        let mut buf = alloc::vec![0u8; sigma_sys::api::DMESG_CAP];
+        match sys::api::dmesg(&mut buf) {
+            Ok(n) => Some(alloc::string::String::from_utf8_lossy(&buf[..n]).into_owned()),
+            Err(_) => None,
+        }
+    }
 }
 
 /// Naked entry: the kernel hands us a 16-byte-aligned RSP, but a

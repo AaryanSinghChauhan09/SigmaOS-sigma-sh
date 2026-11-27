@@ -163,6 +163,10 @@ pub trait System {
     fn os_name(&self) -> &'static str {
         "SigmaOS"
     }
+    /// Kernel ring-buffer contents for `dmesg`. Default: unsupported.
+    fn dmesg(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A parsed command line.
@@ -2220,6 +2224,7 @@ where
             "fork" => self.cmd_fork(),
             "exec" => self.cmd_exec(&args),
             "uname" => self.cmd_uname(&args),
+            "dmesg" => self.cmd_dmesg(),
             "arch" => self.emit("x86_64"),
             "hostname" => self.cmd_hostname(&args),
             "mem" => self.cmd_mem(),
@@ -3896,6 +3901,33 @@ where
             return;
         }
         self.emit(&parts.join(" "));
+    }
+
+    /// `dmesg` — print the kernel ring buffer.
+    fn cmd_dmesg(&mut self) {
+        match self.sys.dmesg() {
+            Some(s) => {
+                // Sanitize non-printable bytes; the log is already
+                // newline-terminated records.
+                for chunk in s.split_inclusive('\n') {
+                    let clean: String = chunk
+                        .chars()
+                        .map(|c| {
+                            if c.is_ascii_graphic() || c == ' ' || c == '\n' || c == '\t' {
+                                c
+                            } else {
+                                '�'
+                            }
+                        })
+                        .collect();
+                    self.emit(clean.trim_end_matches('\n'));
+                }
+            }
+            None => {
+                self.emit("dmesg: unsupported");
+                self.last_ok = false;
+            }
+        }
     }
 
     /// `hostname [name]` — print or set the system hostname
