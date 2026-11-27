@@ -216,8 +216,8 @@ enum CNode {
 }
 
 /// Compound keywords recognized at the start of a `;`-part.
-const CKWS: [&str; 10] = [
-    "if", "then", "elif", "else", "fi", "for", "while", "until", "do", "done",
+const CKWS: [&str; 11] = [
+    "if", "then", "elif", "else", "fi", "for", "select", "while", "until", "do", "done",
 ];
 
 /// Split `;`-parts into compound tokens. A part like `then echo x`
@@ -294,7 +294,7 @@ impl<'a> CParser<'a> {
                         None => return (nodes, None),
                     }
                 }
-                Some(CTok::Kw("for")) => {
+                Some(CTok::Kw("for")) | Some(CTok::Kw("select")) => {
                     self.bump();
                     match self.for_node() {
                         Some(n) => nodes.push(n),
@@ -1356,7 +1356,7 @@ where
         }
         // Compound commands: `if/for/while/until` opening a `;`-list.
         let first_word = line.split_whitespace().next().unwrap_or("");
-        if matches!(first_word, "if" | "for" | "while" | "until") {
+        if matches!(first_word, "if" | "for" | "select" | "while" | "until") {
             let parts = split_semicolons(line);
             let toks = compound_tokens(&parts);
             let mut p = CParser { toks: &toks, i: 0 };
@@ -1365,7 +1365,7 @@ where
                     p.bump();
                     p.if_node()
                 }
-                Some(CTok::Kw("for")) => {
+                Some(CTok::Kw("for")) | Some(CTok::Kw("select")) => {
                     p.bump();
                     p.for_node()
                 }
@@ -1398,7 +1398,7 @@ where
                 if let Some(last) = segs.last() {
                     if matches!(
                         last.split_whitespace().next(),
-                        Some("if" | "for" | "while" | "until" | "case")
+                        Some("if" | "for" | "select" | "while" | "until" | "case")
                     ) {
                         let commands: Vec<Command> = segs.iter().filter_map(|s| parse(s)).collect();
                         if commands.len() == segs.len() && commands.len() > 1 {
@@ -1479,7 +1479,10 @@ where
             .commands
             .iter()
             .map(|c| {
-                if matches!(c.name.as_str(), "if" | "for" | "while" | "until" | "case") {
+                if matches!(
+                    c.name.as_str(),
+                    "if" | "for" | "select" | "while" | "until" | "case"
+                ) {
                     c.clone()
                 } else {
                     self.expand_command(c.clone())
@@ -1574,7 +1577,10 @@ where
             // Compound stages (`while read`, `if`, `for`, `case`) aren't
             // single Commands — reconstruct the line and run the full
             // executor so `producer | while read l; do ...; done` works.
-            if matches!(cmd.name.as_str(), "if" | "for" | "while" | "until" | "case") {
+            if matches!(
+                cmd.name.as_str(),
+                "if" | "for" | "select" | "while" | "until" | "case"
+            ) {
                 let mut line = cmd.name.clone();
                 for a in &cmd.args {
                     line.push(' ');
@@ -2253,6 +2259,7 @@ where
             "command" => self.cmd_command(&args),
             "readonly" => self.cmd_readonly(&args),
             "local" => self.cmd_local(&args),
+            "." | "source" => self.cmd_source(&args),
             "break" => {
                 if self.loop_depth == 0 {
                     self.last_ok = false;
@@ -3806,6 +3813,28 @@ where
         }
     }
 
+    /// `. FILE` / `source FILE` — execute each line of a script in the
+    /// current shell (functions, vars, and `exit` all apply).
+    fn cmd_source(&mut self, args: &[String]) {
+        let Some(f) = args.first() else {
+            self.last_ok = false;
+            self.emit("source: missing file");
+            return;
+        };
+        let path = self.resolve(Some(f));
+        let Some(text) = self.fs.read_to_string(&path) else {
+            self.last_ok = false;
+            self.emit(&format!("source: {}: no such file", path));
+            return;
+        };
+        for line in text.lines() {
+            if !self.running || self.ret_flag {
+                break;
+            }
+            self.execute(line);
+        }
+    }
+
     /// `local NAME[=value]...` — function-scoped vars, restored on
     /// return. Only valid inside a function body.
     fn cmd_local(&mut self, args: &[String]) {
@@ -4290,6 +4319,7 @@ mod tests {
                 "/tmp/dups" => Some("b\na\na\nc\n".to_string()),
                 "/tmp/tabs" => Some("a\tb\n        indented\n".to_string()),
                 "/tmp/long" => Some("abcdefghijklmnop\n".to_string()),
+                "/tmp/script.sh" => Some("sv=42\necho sourced-$sv\n".to_string()),
                 _ => None,
             }
         }
@@ -5335,5 +5365,20 @@ mod tests {
         }
         assert!(o.contains("readonly variable"), "OUT: {o}");
         assert!(o.contains("can only be used in a function"), "OUT: {o}");
+    }
+
+    #[test]
+    fn select_and_source() {
+        let (mut sh, out) = shell(&[
+            "select c in red green; do echo got-$c; break; done",
+            ". /tmp/script.sh",
+            "echo after-$sv",
+            "exit",
+        ]);
+        sh.run();
+        let o = out.borrow();
+        for want in ["got-red", "sourced-42", "after-42"] {
+            assert!(o.contains(want), "missing {want} OUT: {o}");
+        }
     }
 }
