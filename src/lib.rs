@@ -2235,6 +2235,8 @@ where
             "arch" => self.emit("x86_64"),
             "hostname" => self.cmd_hostname(&args),
             "mem" => self.cmd_mem(),
+            "free" => self.cmd_free(&args),
+            "nproc" => self.cmd_nproc(&args),
             "ps" => self.cmd_ps(),
             "time" | "uptime" => self.emit(&format_u64(self.sys.uptime())),
             "launch" | "run" => {
@@ -4195,6 +4197,39 @@ where
     fn cmd_mem(&mut self) {
         let (total, free) = self.mem.memory_kb();
         self.emit(&format!("mem: {} KiB total, {} KiB free", total, free));
+    }
+
+    /// `free [-m|-g]` — procps-style memory report. memory_kb() is
+    /// KiB; -m reports MiB, -g GiB, default KiB.
+    fn cmd_free(&mut self, args: &[String]) {
+        let (total_kb, free_kb) = self.mem.memory_kb();
+        let scale = match args.first().map(|s| s.as_str()) {
+            Some("-m") | Some("--mega") => 1024,
+            Some("-g") | Some("--giga") => 1024 * 1024,
+            _ => 1,
+        };
+        let unit = if scale == 1 {
+            "KiB"
+        } else if scale == 1024 {
+            "MiB"
+        } else {
+            "GiB"
+        };
+        self.emit(&format!(
+            "               total        used        free   ({})",
+            unit
+        ));
+        self.emit(&format!(
+            "Mem:     {:>10} {:>10} {:>10}",
+            total_kb / scale,
+            (total_kb - free_kb) / scale,
+            free_kb / scale
+        ));
+    }
+
+    /// `nproc [--all]` — number of processing units (SigmaOS: 1).
+    fn cmd_nproc(&mut self, _args: &[String]) {
+        self.emit("1");
     }
 
     fn cmd_ps(&mut self) {
