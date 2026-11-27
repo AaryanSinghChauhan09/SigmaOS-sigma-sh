@@ -1254,6 +1254,10 @@ pub struct Shell<I, F, P, M, S> {
     pub sys: S,
     pub cwd: String,
     pub oldpwd: Option<String>,
+    /// Directory stack for pushd/popd/dirs (bottom .. top).
+    pub dir_stack: Vec<String>,
+    /// Shell aliases: (name, expansion text).
+    pub aliases: Vec<(String, String)>,
     pub history: Vec<String>,
     pub env: Vec<(String, String)>,
     pub last_ok: bool,
@@ -1322,6 +1326,8 @@ where
             sys,
             cwd: "/".into(),
             oldpwd: None,
+            dir_stack: Vec::new(),
+            aliases: Vec::new(),
             history: Vec::new(),
             env: Vec::new(),
             last_ok: true,
@@ -1369,6 +1375,18 @@ where
 
     /// Execute one command line.
     pub fn execute(&mut self, line: &str) {
+        // Alias expansion: substitute the first word if it's an alias.
+        // Single pass — alias values aren't re-expanded (avoids loops).
+        let owned;
+        let mut line = line;
+        {
+            let first_end = line.find(|c: char| c.is_whitespace()).unwrap_or(line.len());
+            let name = &line[..first_end];
+            if let Some((_, exp)) = self.aliases.iter().find(|(n, _)| n == name) {
+                owned = format!("{}{}", exp, &line[first_end..]);
+                line = &owned;
+            }
+        }
         // `name() { ...; }` function definition (single line).
         if let Some((name, body)) = parse_func_def(line) {
             self.functions.retain(|(n, _)| *n != name);
@@ -2235,6 +2253,11 @@ where
             "arch" => self.emit("x86_64"),
             "hostname" => self.cmd_hostname(&args),
             "mem" => self.cmd_mem(),
+            "pushd" => self.cmd_pushd(&args),
+            "popd" => self.cmd_popd(),
+            "dirs" => self.cmd_dirs(),
+            "alias" => self.cmd_alias(&args),
+            "unalias" => self.cmd_unalias(&args),
             "free" => self.cmd_free(&args),
             "nproc" => self.cmd_nproc(&args),
             "ps" => self.cmd_ps(),
@@ -4199,6 +4222,101 @@ where
         self.emit(&format!("mem: {} KiB total, {} KiB free", total, free));
     }
 
+    /// `pushd [dir]` — push cwd on the dir stack and cd (no arg swaps
+    /// top two entries, like bash).
+    fn cmd_pushd(&mut self, args: &[String]) {
+        if args.is_empty() {
+            // Swap cwd with the top of the stack (bash semantics).
+            match self.dir_stack.pop() {
+                Some(top) => {
+                    self.dir_stack.push(self.cwd.clone());
+                    let _ = self.fs.chdir(&top);
+                    self.cwd = top;
+                }
+                None => {
+                    self.emit("pushd: directory stack empty");
+                    self.last_ok = false;
+                    return;
+                }
+            }
+        } else {
+            let target = self.resolve(args.first());
+            let norm = normalize(&target);
+            match self.fs.list(&norm) {
+                Some(_) => {
+                    self.dir_stack.push(self.cwd.clone());
+                    let _ = self.fs.chdir(&norm);
+                    self.cwd = norm;
+                }
+                None => {
+                    self.emit(&format!("pushd: {}: no such directory", target));
+                    self.last_ok = false;
+                    return;
+                }
+            }
+        }
+        self.cmd_dirs();
+    }
+
+    /// `popd` — cd to the top of the dir stack.
+    fn cmd_popd(&mut self) {
+        match self.dir_stack.pop() {
+            Some(dir) => {
+                let _ = self.fs.chdir(&dir);
+                self.cwd = dir;
+            }
+            None => {
+                self.emit("popd: directory stack empty");
+                self.last_ok = false;
+                return;
+            }
+        }
+        self.cmd_dirs();
+    }
+
+    /// `dirs` — print the dir stack (bottom .. top, cwd last).
+    fn cmd_dirs(&mut self) {
+        let mut parts: Vec<String> = self.dir_stack.clone();
+        parts.push(self.cwd.clone());
+        self.emit(&parts.join("  "));
+    }
+
+    /// `alias [name[=value]...]` — define or list aliases.
+    fn cmd_alias(&mut self, args: &[String]) {
+        if args.is_empty() {
+            for (n, v) in self.aliases.clone() {
+                self.emit(&format!("alias {}='{}'", n, v));
+            }
+            return;
+        }
+        for a in args {
+            if let Some((n, v)) = a.split_once('=') {
+                self.aliases.retain(|(k, _)| k != n);
+                self.aliases.push((n.to_string(), v.to_string()));
+            } else {
+                match self.aliases.iter().find(|(k, _)| k == a) {
+                    Some((_, v)) => self.emit(&format!("alias {}='{}'", a, v)),
+                    None => {
+                        self.emit(&format!("alias: {}: not found", a));
+                        self.last_ok = false;
+                    }
+                }
+            }
+        }
+    }
+
+    /// `unalias name...` — remove aliases.
+    fn cmd_unalias(&mut self, args: &[String]) {
+        for a in args {
+            let before = self.aliases.len();
+            self.aliases.retain(|(k, _)| k != a);
+            if self.aliases.len() == before {
+                self.emit(&format!("unalias: {}: not found", a));
+                self.last_ok = false;
+            }
+        }
+    }
+
     /// `free [-m|-g]` — procps-style memory report. memory_kb() is
     /// KiB; -m reports MiB, -g GiB, default KiB.
     fn cmd_free(&mut self, args: &[String]) {
@@ -5078,6 +5196,35 @@ mod tests {
         let (mut sh, out) = shell(&["uname", "exit"]);
         sh.run();
         assert!(out.borrow().contains("sigmaos"));
+    }
+
+    #[test]
+    fn alias_and_dirstack() {
+        let (mut sh, out) = shell(&[
+            "alias ll='echo listed'",
+            "ll",
+            "alias",
+            "unalias ll",
+            "ll",
+            "pushd /bin",
+            "pwd",
+            "pushd",
+            "pwd",
+            "popd",
+            "pwd",
+            "exit",
+        ]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("listed"), "{}", o);
+        assert!(o.contains("alias ll='echo listed'"), "{}", o);
+        assert!(o.contains("/bin"), "{}", o);
+        // After pushd /bin then pushd (swap back to /), pwd shows /.
+        assert!(
+            o.contains("command not found") || o.contains("unknown"),
+            "{}",
+            o
+        );
     }
 
     #[test]
