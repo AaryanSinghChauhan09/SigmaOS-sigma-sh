@@ -178,6 +178,11 @@ impl System for StdSys {
     fn sleep(&self, secs: u64) {
         std::thread::sleep(std::time::Duration::from_secs(secs));
     }
+    fn fork(&self) -> i64 {
+        // Host build: no kernel fork — report unsupported.
+        -1
+    }
+
     fn kill(&self, pid: i64, sig: &str) -> bool {
         Proc::new("kill")
             .arg("-s")

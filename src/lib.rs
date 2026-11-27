@@ -132,6 +132,11 @@ pub trait System {
     fn kill(&self, _pid: i64, _sig: &str) -> bool {
         false
     }
+    /// fork(2): duplicate the calling process. Parent gets child pid,
+    /// child gets 0. Default: unsupported (-1).
+    fn fork(&self) -> i64 {
+        -1
+    }
     /// Kernel/OS name for `uname`. Default: sigmaos.
     fn uname(&self) -> &'static str {
         "sigmaos"
@@ -2190,6 +2195,7 @@ where
             "sleep" => self.cmd_sleep(&args),
             "read" => self.cmd_read(&args),
             "kill" => self.cmd_kill(&args),
+            "fork" => self.cmd_fork(),
             "uname" => self.emit(self.sys.uname()),
             "arch" => self.emit("x86_64"),
             "hostname" => self.cmd_hostname(&args),
@@ -2619,6 +2625,7 @@ where
             "  uname            print OS name",
             "  arch             print machine arch",
             "  hostname [name]  print or set hostname",
+            "  fork             duplicate this process (child exits)",
             "  true/:/false    no-op / fail (for && and ||)",
             "  clear           clear the screen",
             "  mem             memory usage",
@@ -3814,6 +3821,21 @@ where
                 self.set_var(k, &v);
             }
             self.readonly_vars.push(k.to_string());
+        }
+    }
+
+    /// `fork` — duplicate this shell process. The child (return 0)
+    /// prints a marker and exits the REPL; the parent continues.
+    fn cmd_fork(&mut self) {
+        let r = self.sys.fork();
+        if r == 0 {
+            self.emit("fork: child process");
+            self.running = false; // child exits after this line
+        } else if r > 0 {
+            self.emit(&format!("fork: child pid {}", r));
+        } else {
+            self.last_ok = false;
+            self.emit("fork: unsupported");
         }
     }
 
@@ -5415,5 +5437,13 @@ mod tests {
         let o = out.borrow();
         assert!(o.contains("sigmaos"), "OUT: {o}");
         assert!(o.contains("x86_64"), "OUT: {o}");
+    }
+
+    #[test]
+    fn fork_builtin_reports_unsupported() {
+        let (mut sh, out) = shell(&["fork", "exit"]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("fork: unsupported"), "OUT: {o}");
     }
 }

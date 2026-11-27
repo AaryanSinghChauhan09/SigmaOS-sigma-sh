@@ -299,6 +299,10 @@ impl System for SysSystem {
         }
     }
 
+    fn fork(&self) -> i64 {
+        sigma_sys::api::fork().unwrap_or(-1)
+    }
+
     fn kill(&self, pid: i64, sig: &str) -> bool {
         let code = sig.parse::<i64>().unwrap_or(match sig {
             "HUP" => 1,
