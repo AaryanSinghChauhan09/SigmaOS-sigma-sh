@@ -331,11 +331,14 @@ impl System for SysSystem {
     }
 
     fn uname(&self) -> &'static str {
-        // kernel_version() allocates; leak the small string once per call.
-        match sys::api::kernel_version() {
-            Ok(v) => Box::leak(v.into_boxed_str()),
-            Err(_) => "sigmaos",
-        }
+        "sigmaos"
+    }
+
+    fn kernel_release(&self) -> String {
+        // kernel_version() allocates; return an owned String.
+        sys::api::kernel_version()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|_| "unknown".into())
     }
 }
 

@@ -151,6 +151,18 @@ pub trait System {
     fn uname(&self) -> &'static str {
         "sigmaos"
     }
+    /// Kernel release string for `uname -r`. Default: unknown.
+    fn kernel_release(&self) -> String {
+        "unknown".into()
+    }
+    /// Machine hardware name for `uname -m`. Default: x86_64.
+    fn machine(&self) -> &'static str {
+        "x86_64"
+    }
+    /// OS distribution name for `uname -o`. Default: SigmaOS.
+    fn os_name(&self) -> &'static str {
+        "SigmaOS"
+    }
 }
 
 /// A parsed command line.
@@ -2207,7 +2219,7 @@ where
             "kill" => self.cmd_kill(&args),
             "fork" => self.cmd_fork(),
             "exec" => self.cmd_exec(&args),
-            "uname" => self.emit(self.sys.uname()),
+            "uname" => self.cmd_uname(&args),
             "arch" => self.emit("x86_64"),
             "hostname" => self.cmd_hostname(&args),
             "mem" => self.cmd_mem(),
@@ -3850,6 +3862,42 @@ where
         }
     }
 
+    /// `uname [-a] [-s] [-n] [-r] [-m] [-o]` — POSIX uname.
+    /// No flags prints the kernel name (`-s`); `-a` prints all fields.
+    fn cmd_uname(&mut self, args: &[String]) {
+        let flags: Vec<&str> = args.iter().map(|a| a.as_str()).collect();
+        let all = flags.iter().any(|f| *f == "-a" || *f == "--all");
+        let has = |f: &str| all || flags.contains(&f);
+        let mut parts: Vec<String> = Vec::new();
+        if has("-s") || has("--kernel-name") || (flags.is_empty() && !all) {
+            parts.push(self.sys.uname().to_string());
+        }
+        if has("-n") || has("--nodename") {
+            parts.push(
+                self.fs
+                    .read_to_string("/etc/hostname")
+                    .map(|h| h.trim_end().to_string())
+                    .filter(|h| !h.is_empty())
+                    .unwrap_or_else(|| "sigmaos".into()),
+            );
+        }
+        if has("-r") || has("--kernel-release") {
+            parts.push(self.sys.kernel_release());
+        }
+        if has("-m") || has("--machine") || has("--hardware-platform") {
+            parts.push(self.sys.machine().to_string());
+        }
+        if has("-o") || has("--operating-system") {
+            parts.push(self.sys.os_name().to_string());
+        }
+        if parts.is_empty() {
+            // Unknown flags: behave like bare uname.
+            self.emit(self.sys.uname());
+            return;
+        }
+        self.emit(&parts.join(" "));
+    }
+
     /// `hostname [name]` — print or set the system hostname
     /// (backed by /etc/hostname in the initramfs).
     fn cmd_hostname(&mut self, args: &[String]) {
@@ -4159,12 +4207,9 @@ where
     /// wait-any is unsupported (host builds).
     fn cmd_wait(&mut self, args: &[String]) {
         if args.is_empty() {
-            match self.sys.wait_any() {
-                Ok(status) => {
-                    self.emit(&format!("wait: child exited {}", status));
-                    return;
-                }
-                Err(_) => {}
+            if let Ok(status) = self.sys.wait_any() {
+                self.emit(&format!("wait: child exited {}", status));
+                return;
             }
         }
         let pid = match args.first() {
@@ -4914,6 +4959,23 @@ mod tests {
         let (mut sh, out) = shell(&["uname", "exit"]);
         sh.run();
         assert!(out.borrow().contains("sigmaos"));
+    }
+
+    #[test]
+    fn uname_flags() {
+        let (mut sh, out) = shell(&["uname -s", "uname -m", "uname -o", "uname -a", "exit"]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("sigmaos"), "{}", o); // -s
+        assert!(o.contains("x86_64"), "{}", o); // -m
+        assert!(o.contains("SigmaOS"), "{}", o); // -o
+                                                 // -a line carries all fields together.
+        assert!(
+            o.lines()
+                .any(|l| l.contains("sigmaos") && l.contains("x86_64") && l.contains("SigmaOS")),
+            "{}",
+            o
+        );
     }
 
     #[test]
