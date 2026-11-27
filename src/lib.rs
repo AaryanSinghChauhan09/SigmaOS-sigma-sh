@@ -568,6 +568,54 @@ fn split_case_pats(s: &str) -> Vec<String> {
     out
 }
 
+/// Split on top-level `|` (not `||`) outside quotes and `$(` parens,
+/// returning raw segment strings (unlike parse_pipeline which parses).
+fn split_pipe_str(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_d = false;
+    let mut in_s = false;
+    let mut depth = 0usize;
+    let mut prev_dollar = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        let opens_sub = prev_dollar && c == '(' && !in_d && !in_s;
+        prev_dollar = c == '$' && !in_d && !in_s;
+        if opens_sub {
+            depth += 1;
+        }
+        match c {
+            '"' if !in_s => {
+                in_d = !in_d;
+                cur.push(c);
+            }
+            '\'' if !in_d => {
+                in_s = !in_s;
+                cur.push(c);
+            }
+            '(' if !in_d && !in_s && depth > 0 && !opens_sub => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' if !in_d && !in_s && depth > 0 => {
+                depth -= 1;
+                cur.push(c);
+            }
+            '|' if !in_d && !in_s && depth == 0 => {
+                if chars.peek() == Some(&'|') {
+                    cur.push(c);
+                    cur.push(chars.next().unwrap());
+                } else {
+                    out.push(core::mem::take(&mut cur));
+                }
+            }
+            _ => cur.push(c),
+        }
+    }
+    out.push(cur);
+    out
+}
+
 /// Split on `;;` outside quotes and substitution parens.
 fn split_double_semis(s: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -1177,6 +1225,11 @@ pub struct Shell<I, F, P, M, S> {
     pub brk_flag: bool,
     /// Set by `continue`; consumed by the innermost enclosing loop.
     pub cont_flag: bool,
+    /// `read` cursor: unconsumed remainder of piped stdin. Unlike
+    /// `pending_stdin` this survives per-command cleanup so
+    /// `while read` loops consume a pipe line-by-line. Reset at
+    /// pipeline boundaries; `Some("")` marks EOF.
+    pub stdin_rest: Option<String>,
 }
 
 impl<I, F, P, M, S> Shell<I, F, P, M, S>
@@ -1217,6 +1270,7 @@ where
             loop_depth: 0,
             brk_flag: false,
             cont_flag: false,
+            stdin_rest: None,
         }
     }
 
@@ -1290,6 +1344,28 @@ where
             // Parse failed — fall through; keywords become
             // command-not-found errors like bash's syntax error.
         }
+        // Pipeline ending in a compound stage (`prod | while read l;
+        // do ...; done`): the compound's own `;` would be mistaken
+        // for command separators, so route the whole line to the
+        // pipeline executor before `;` splitting. Restricted to a
+        // compound LAST stage with no `;` before the first `|`.
+        if let Some(fp) = line.find('|') {
+            if !line[..fp].contains(';') {
+                let segs = split_pipe_str(line);
+                if let Some(last) = segs.last() {
+                    if matches!(
+                        last.trim_start().split_whitespace().next(),
+                        Some("if" | "for" | "while" | "until" | "case")
+                    ) {
+                        let commands: Vec<Command> = segs.iter().filter_map(|s| parse(s)).collect();
+                        if commands.len() == segs.len() && commands.len() > 1 {
+                            self.execute_pipeline(&Pipeline { commands });
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         // `;` separates commands (quote-aware). A lone trailing `;`
         // also counts — otherwise parse() would keep it as an arg.
         let parts = split_semicolons(line);
@@ -1354,10 +1430,18 @@ where
         // An outer capture (from `$(...)`) steals the last stage's
         // console output too; save it and merge at the end.
         let outer_cap = self.capture.take();
+        // Compound stages keep raw args — they're re-parsed by
+        // execute() and must see `$vars` unexpanded per iteration.
         let cmds: Vec<Command> = pipeline
             .commands
             .iter()
-            .map(|c| self.expand_command(c.clone()))
+            .map(|c| {
+                if matches!(c.name.as_str(), "if" | "for" | "while" | "until" | "case") {
+                    c.clone()
+                } else {
+                    self.expand_command(c.clone())
+                }
+            })
             .collect();
         let n = cmds.len();
         if n == 0 {
@@ -1444,7 +1528,19 @@ where
             }
             self.pipe_in_fd = in_fd;
             self.pipe_out_fd = out_fd;
-            self.execute_single_command(cmd);
+            // Compound stages (`while read`, `if`, `for`, `case`) aren't
+            // single Commands — reconstruct the line and run the full
+            // executor so `producer | while read l; do ...; done` works.
+            if matches!(cmd.name.as_str(), "if" | "for" | "while" | "until" | "case") {
+                let mut line = cmd.name.clone();
+                for a in &cmd.args {
+                    line.push(' ');
+                    line.push_str(a);
+                }
+                self.execute(&line);
+            } else {
+                self.execute_single_command(cmd);
+            }
             self.pipe_in_fd = 0;
             self.pipe_out_fd = 0;
 
@@ -1472,6 +1568,7 @@ where
             }
         }
         self.pending_stdin = None;
+        self.stdin_rest = None;
         if let Some(mut outer) = outer_cap {
             if let Some(last_txt) = self.capture.take() {
                 outer.push_str(&last_txt);
@@ -1929,6 +2026,7 @@ where
             "tee" => self.cmd_tee(&args),
             "env" => self.cmd_env(&args),
             "sleep" => self.cmd_sleep(&args),
+            "read" => self.cmd_read(&args),
             "kill" => self.cmd_kill(&args),
             "uname" => self.emit(self.sys.uname()),
             "mem" => self.cmd_mem(),
@@ -3503,6 +3601,85 @@ where
         }
     }
 
+    /// Upsert a shell variable in `env`.
+    fn set_var(&mut self, k: &str, v: &str) {
+        if let Some(e) = self.env.iter_mut().find(|(ek, _)| ek == k) {
+            e.1 = v.to_string();
+        } else {
+            self.env.push((k.to_string(), v.to_string()));
+        }
+    }
+
+    /// `read VAR...` — consume one line from piped stdin (leaving the
+    /// remainder buffered for the next `read`, enabling `while read`
+    /// loops) or from console input. Last var gets leftover words.
+    /// EOF sets vars empty and fails, per POSIX.
+    fn cmd_read(&mut self, args: &[String]) {
+        if args.is_empty() {
+            self.last_ok = false;
+            self.emit("read: missing variable name");
+            return;
+        }
+        // Source priority: read cursor (piped remainder), fresh
+        // pending_stdin (this command's pipe feed), then console.
+        let line = if let Some(text) = self.stdin_rest.take() {
+            match text.find('\n') {
+                Some(nl) => {
+                    let l = text[..nl].to_string();
+                    self.stdin_rest = Some(text[nl + 1..].to_string());
+                    Some(l)
+                }
+                None => {
+                    self.stdin_rest = Some(String::new()); // EOF marker
+                    if text.is_empty() {
+                        None
+                    } else {
+                        Some(text)
+                    }
+                }
+            }
+        } else if self.pending_stdin.is_some() {
+            let text = self.pending_stdin.take().unwrap_or_default();
+            match text.find('\n') {
+                Some(nl) => {
+                    let l = text[..nl].to_string();
+                    self.stdin_rest = Some(text[nl + 1..].to_string());
+                    Some(l)
+                }
+                None => {
+                    self.stdin_rest = Some(String::new());
+                    if text.is_empty() {
+                        None
+                    } else {
+                        Some(text)
+                    }
+                }
+            }
+        } else {
+            self.io.read_line()
+        };
+        let Some(line) = line else {
+            for a in args {
+                self.set_var(a, "");
+            }
+            self.last_ok = false;
+            return;
+        };
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let n = args.len();
+        for (i, a) in args.iter().enumerate() {
+            let v = if n == 1 {
+                line.trim().to_string()
+            } else if i + 1 == n {
+                words[i.min(words.len())..].join(" ")
+            } else {
+                words.get(i).copied().unwrap_or("").to_string()
+            };
+            self.set_var(a, &v);
+        }
+        self.last_ok = true;
+    }
+
     fn cmd_sleep(&mut self, args: &[String]) {
         let Some(a) = args.first() else {
             self.emit("sleep: missing seconds");
@@ -4832,5 +5009,20 @@ mod tests {
             assert!(o.contains(want), "missing {want} OUT: {o}");
         }
         assert!(!o.contains("no-match"), "OUT: {o}");
+    }
+
+    #[test]
+    fn read_builtin_and_while_read() {
+        let (mut sh, out) = shell(&[
+            "printf \"one\\ntwo\\nthree\\n\" | while read l; do echo got-$l; done",
+            "echo aa bb cc | read a b c",
+            "echo A=$a B=$b C=$c",
+            "exit",
+        ]);
+        sh.run();
+        let o = out.borrow();
+        for want in ["got-one", "got-two", "got-three", "A=aa", "B=bb", "C=cc"] {
+            assert!(o.contains(want), "missing {want} OUT: {o}");
+        }
     }
 }
