@@ -847,8 +847,11 @@ pub fn parse_pipeline(line: &str) -> Option<Pipeline> {
     let mut in_dquote = false;
     let mut in_squote = false;
     let mut sub_depth = 0usize;
+    let mut cond_depth = 0usize;
+    let cond_ok = line.contains("]]");
     let mut prev_dollar = false;
-    for c in line.chars() {
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
         let opens_sub = prev_dollar && c == '(' && !in_dquote && !in_squote;
         prev_dollar = c == '$' && !in_dquote && !in_squote;
         if opens_sub {
@@ -863,6 +866,22 @@ pub fn parse_pipeline(line: &str) -> Option<Pipeline> {
                 in_squote = !in_squote;
                 cur.push(c);
             }
+            // `[[ ... ]]` regions shield their operators from splitting.
+            '[' if !in_dquote
+                && !in_squote
+                && cond_ok
+                && cond_depth == 0
+                && chars.peek() == Some(&'[') =>
+            {
+                chars.next();
+                cond_depth += 1;
+                cur.push_str("[[");
+            }
+            ']' if !in_dquote && !in_squote && cond_depth > 0 && chars.peek() == Some(&']') => {
+                chars.next();
+                cond_depth -= 1;
+                cur.push_str("]]");
+            }
             // Inside a substitution, ALL parens count toward depth —
             // `$(( ))` arithmetic and subshell `( )` nest correctly.
             '(' if !in_dquote && !in_squote && sub_depth > 0 && !opens_sub => {
@@ -873,7 +892,7 @@ pub fn parse_pipeline(line: &str) -> Option<Pipeline> {
                 sub_depth -= 1;
                 cur.push(c);
             }
-            '|' if !in_dquote && !in_squote && sub_depth == 0 => {
+            '|' if !in_dquote && !in_squote && sub_depth == 0 && cond_depth == 0 => {
                 let t = cur.trim();
                 if !t.is_empty() {
                     segments.push(t.to_string());
@@ -903,8 +922,11 @@ pub fn split_semicolons(line: &str) -> Vec<String> {
     let mut in_dquote = false;
     let mut in_squote = false;
     let mut sub_depth = 0usize;
+    let mut cond_depth = 0usize;
+    let cond_ok = line.contains("]]");
     let mut prev_dollar = false;
-    for c in line.chars() {
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
         let opens_sub = prev_dollar && c == '(' && !in_dquote && !in_squote;
         prev_dollar = c == '$' && !in_dquote && !in_squote;
         if opens_sub {
@@ -919,6 +941,22 @@ pub fn split_semicolons(line: &str) -> Vec<String> {
                 in_squote = !in_squote;
                 cur.push(c);
             }
+            // `[[ ... ]]` regions shield their operators from splitting.
+            '[' if !in_dquote
+                && !in_squote
+                && cond_ok
+                && cond_depth == 0
+                && chars.peek() == Some(&'[') =>
+            {
+                chars.next();
+                cond_depth += 1;
+                cur.push_str("[[");
+            }
+            ']' if !in_dquote && !in_squote && cond_depth > 0 && chars.peek() == Some(&']') => {
+                chars.next();
+                cond_depth -= 1;
+                cur.push_str("]]");
+            }
             // Inside a substitution, ALL parens count toward depth —
             // `$(( ))` arithmetic and subshell `( )` nest correctly.
             '(' if !in_dquote && !in_squote && sub_depth > 0 && !opens_sub => {
@@ -929,7 +967,7 @@ pub fn split_semicolons(line: &str) -> Vec<String> {
                 sub_depth -= 1;
                 cur.push(c);
             }
-            ';' if !in_dquote && !in_squote && sub_depth == 0 => {
+            ';' if !in_dquote && !in_squote && sub_depth == 0 && cond_depth == 0 => {
                 let t = cur.trim();
                 if !t.is_empty() {
                     parts.push(t.to_string());
@@ -954,6 +992,8 @@ pub fn split_and(line: &str) -> Vec<String> {
     let mut in_squote = false;
     let mut chars = line.chars().peekable();
     let mut sub_depth = 0usize;
+    let mut cond_depth = 0usize;
+    let cond_ok = line.contains("]]");
     let mut prev_dollar = false;
     while let Some(c) = chars.next() {
         let opens_sub = prev_dollar && c == '(' && !in_dquote && !in_squote;
@@ -970,6 +1010,22 @@ pub fn split_and(line: &str) -> Vec<String> {
                 in_squote = !in_squote;
                 cur.push(c);
             }
+            // `[[ ... ]]` regions shield their && / || from splitting.
+            '[' if !in_dquote
+                && !in_squote
+                && cond_ok
+                && cond_depth == 0
+                && chars.peek() == Some(&'[') =>
+            {
+                chars.next();
+                cond_depth += 1;
+                cur.push_str("[[");
+            }
+            ']' if !in_dquote && !in_squote && cond_depth > 0 && chars.peek() == Some(&']') => {
+                chars.next();
+                cond_depth -= 1;
+                cur.push_str("]]");
+            }
             // Inside a substitution, ALL parens count toward depth —
             // `$(( ))` arithmetic and subshell `( )` nest correctly.
             '(' if !in_dquote && !in_squote && sub_depth > 0 && !opens_sub => {
@@ -980,7 +1036,12 @@ pub fn split_and(line: &str) -> Vec<String> {
                 sub_depth -= 1;
                 cur.push(c);
             }
-            '&' if !in_dquote && !in_squote && sub_depth == 0 && chars.peek() == Some(&'&') => {
+            '&' if !in_dquote
+                && !in_squote
+                && sub_depth == 0
+                && cond_depth == 0
+                && chars.peek() == Some(&'&') =>
+            {
                 chars.next();
                 let t = cur.trim();
                 if !t.is_empty() {
@@ -1027,6 +1088,8 @@ pub fn split_or(line: &str) -> Vec<String> {
     let mut in_squote = false;
     let mut chars = line.chars().peekable();
     let mut sub_depth = 0usize;
+    let mut cond_depth = 0usize;
+    let cond_ok = line.contains("]]");
     let mut prev_dollar = false;
     while let Some(c) = chars.next() {
         let opens_sub = prev_dollar && c == '(' && !in_dquote && !in_squote;
@@ -1043,6 +1106,22 @@ pub fn split_or(line: &str) -> Vec<String> {
                 in_squote = !in_squote;
                 cur.push(c);
             }
+            // `[[ ... ]]` regions shield their && / || from splitting.
+            '[' if !in_dquote
+                && !in_squote
+                && cond_ok
+                && cond_depth == 0
+                && chars.peek() == Some(&'[') =>
+            {
+                chars.next();
+                cond_depth += 1;
+                cur.push_str("[[");
+            }
+            ']' if !in_dquote && !in_squote && cond_depth > 0 && chars.peek() == Some(&']') => {
+                chars.next();
+                cond_depth -= 1;
+                cur.push_str("]]");
+            }
             // Inside a substitution, ALL parens count toward depth —
             // `$(( ))` arithmetic and subshell `( )` nest correctly.
             '(' if !in_dquote && !in_squote && sub_depth > 0 && !opens_sub => {
@@ -1053,7 +1132,12 @@ pub fn split_or(line: &str) -> Vec<String> {
                 sub_depth -= 1;
                 cur.push(c);
             }
-            '|' if !in_dquote && !in_squote && sub_depth == 0 && chars.peek() == Some(&'|') => {
+            '|' if !in_dquote
+                && !in_squote
+                && sub_depth == 0
+                && cond_depth == 0
+                && chars.peek() == Some(&'|') =>
+            {
                 chars.next();
                 let t = cur.trim();
                 if !t.is_empty() {
@@ -1072,6 +1156,144 @@ pub fn split_or(line: &str) -> Vec<String> {
 }
 
 /// Recursive-descent parser for `test`/`[` expressions.
+/// Parser for `[[ EXPR ]]` — bash conditional semantics. Unlike
+/// `test`, `==`/`!=` treat the RHS as a glob pattern and `&&`/`||`
+/// replace `-a`/`-o`.
+struct CondParser<'a, I, F, P, M, S> {
+    sh: &'a Shell<I, F, P, M, S>,
+    args: &'a [&'a str],
+    i: usize,
+}
+
+impl<'a, I: Io, F: Fs, P: ProcTable, M: MemInfo, S: System> CondParser<'a, I, F, P, M, S> {
+    fn peek(&self) -> Option<&'a str> {
+        self.args.get(self.i).copied()
+    }
+    fn next(&mut self) -> Option<&'a str> {
+        let t = self.peek();
+        if t.is_some() {
+            self.i += 1;
+        }
+        t
+    }
+    fn parse_or(&mut self) -> bool {
+        let mut v = self.parse_and();
+        while self.peek() == Some("||") {
+            self.next();
+            let r = self.parse_and();
+            v = v || r;
+        }
+        v
+    }
+    fn parse_and(&mut self) -> bool {
+        let mut v = self.parse_not();
+        while self.peek() == Some("&&") {
+            self.next();
+            let r = self.parse_not();
+            v = v && r;
+        }
+        v
+    }
+    fn parse_not(&mut self) -> bool {
+        if self.peek() == Some("!") {
+            self.next();
+            return !self.parse_not();
+        }
+        self.parse_primary()
+    }
+    fn parse_primary(&mut self) -> bool {
+        let Some(first) = self.next() else {
+            return false;
+        };
+        if first == "(" {
+            let v = self.parse_or();
+            if self.peek() == Some(")") {
+                self.next();
+            }
+            return v;
+        }
+        // Unary tests, incl. `-v VAR` (variable is set).
+        if matches!(
+            first,
+            "-e" | "-f" | "-d" | "-s" | "-r" | "-w" | "-x" | "-n" | "-z" | "-v"
+        ) {
+            let Some(arg) = self.next() else {
+                return false;
+            };
+            if first == "-v" {
+                return self.sh.env.iter().any(|(k, _)| k == arg);
+            }
+            return self.unary_test(first, arg);
+        }
+        // Binary tests.
+        if let Some(op) = self.peek() {
+            if matches!(
+                op,
+                "=" | "=="
+                    | "!="
+                    | "=~"
+                    | "<"
+                    | ">"
+                    | "-eq"
+                    | "-ne"
+                    | "-lt"
+                    | "-le"
+                    | "-gt"
+                    | "-ge"
+            ) {
+                self.next();
+                let Some(rhs) = self.next() else {
+                    return false;
+                };
+                return self.binary_test(first, op, rhs);
+            }
+        }
+        !first.is_empty()
+    }
+    fn unary_test(&self, op: &str, arg: &str) -> bool {
+        let path = self.sh.resolve(Some(&arg.to_string()));
+        match op {
+            "-n" => !arg.is_empty(),
+            "-z" => arg.is_empty(),
+            "-e" | "-f" | "-d" | "-s" => match self.sh.fs.stat(&path) {
+                Some((is_dir, size)) => match op {
+                    "-e" => true,
+                    "-f" => !is_dir,
+                    "-d" => is_dir,
+                    _ => size > 0,
+                },
+                None => false,
+            },
+            _ => self.sh.fs.stat(&path).is_some(),
+        }
+    }
+    fn binary_test(&self, a: &str, op: &str, b: &str) -> bool {
+        match op {
+            // `==`/`!=` are glob patterns on the RHS in [[ ]].
+            "=" | "==" => glob_match(b, a),
+            "!=" => !glob_match(b, a),
+            // `=~` is ERE in bash; no regex engine here, so the RHS is
+            // treated as a glob (covers the common `str*`/`*.log` cases).
+            "=~" => glob_match(b, a),
+            "<" => a < b,
+            ">" => a > b,
+            _ => {
+                let (Ok(x), Ok(y)) = (a.parse::<i64>(), b.parse::<i64>()) else {
+                    return false;
+                };
+                match op {
+                    "-eq" => x == y,
+                    "-ne" => x != y,
+                    "-lt" => x < y,
+                    "-le" => x <= y,
+                    "-gt" => x > y,
+                    _ => x >= y,
+                }
+            }
+        }
+    }
+}
+
 struct TestParser<'a, I, F, P, M, S> {
     sh: &'a Shell<I, F, P, M, S>,
     args: &'a [&'a str],
@@ -2247,6 +2469,7 @@ where
             "printf" => self.cmd_printf(&args),
             "test" => self.cmd_test(&args, false),
             "[" => self.cmd_test(&args, true),
+            "[[" => self.cmd_cond(&args),
             "tr" => self.cmd_tr(&args),
             "cut" => self.cmd_cut(&args),
             "nl" => self.cmd_nl(&args),
@@ -3484,6 +3707,26 @@ where
             i: 0,
         };
         p.parse_or()
+    }
+
+    /// `[[ EXPR ]]` — bash conditional expression: `&&`/`||`/`!`
+    /// combinators, glob patterns on `==`/`!=`, `=~` (glob
+    /// approximation of ERE), `-v VAR`.
+    fn cmd_cond(&mut self, args: &[String]) {
+        let mut inner: Vec<&str> = args.iter().map(|a| a.as_str()).collect();
+        if inner.last() == Some(&"]]") {
+            inner.pop();
+        } else {
+            self.emit("[[: missing ]]");
+            self.last_ok = false;
+            return;
+        }
+        let mut p = CondParser {
+            sh: self,
+            args: &inner,
+            i: 0,
+        };
+        self.last_ok = p.parse_or();
     }
 
     /// `tr [-d] SET1 [SET2]` — translate or delete characters from
@@ -4823,7 +5066,7 @@ fn glob_match(pat: &str, name: &str) -> bool {
 /// Names handled by the builtin dispatch in execute_single_command.
 /// Kept in sync with the match arms; used by `type`/`builtin`.
 const BUILTIN_NAMES: &[&str] = &[
-    ".", ":", "?", "[", "alias", "arch", "basename", "bg", "break", "cat", "cd", "clear",
+    ".", ":", "?", "[", "[[", "alias", "arch", "basename", "bg", "break", "cat", "cd", "clear",
     "command", "continue", "cp", "cut", "dirname", "dirs", "dmesg", "df", "echo", "env", "exec",
     "exit", "expand", "export", "false", "fc", "fg", "find", "fold", "fork", "free", "grep",
     "groups", "head", "help", "history", "hostname", "id", "jobs", "kill", "launch", "local",
@@ -6118,5 +6361,25 @@ mod tests {
         sh.run();
         let o = out.borrow();
         assert!(o.contains("fork: unsupported"), "OUT: {o}");
+    }
+
+    #[test]
+    fn cond_brackets_glob_and_logic() {
+        let (mut sh, out) = shell(&[
+            "[[ foo == f* ]] && echo glob-ok",
+            "[[ foo != f* ]] && echo glob-ne",
+            "[[ 3 -gt 2 && ! -z hi ]] && echo logic-ok",
+            "cv=1",
+            "[[ -v cv ]] && echo v-ok",
+            "[[ abc =~ a* ]] && echo re-ok",
+            "exit",
+        ]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("glob-ok"), "OUT: {o}");
+        assert!(o.contains("logic-ok"), "OUT: {o}");
+        assert!(o.contains("v-ok"), "OUT: {o}");
+        assert!(o.contains("re-ok"), "OUT: {o}");
+        assert!(!o.contains("glob-ne"), "OUT: {o}");
     }
 }
