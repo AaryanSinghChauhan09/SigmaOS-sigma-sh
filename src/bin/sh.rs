@@ -352,6 +352,20 @@ impl System for SysSystem {
     fn statfs(&self, path: &str) -> Option<(u64, u64)> {
         sys::api::statfs(path).ok()
     }
+
+    fn mount(&self, source: &str, target: &str, fstype: &str) -> Result<(), String> {
+        sys::api::mount(source, target, fstype).map_err(|e| format!("mount: {}", e))
+    }
+
+    fn umount(&self, target: &str) -> Result<(), String> {
+        sys::api::umount(target).map_err(|e| format!("umount: {}", e))
+    }
+
+    fn mountlist(&self) -> Option<Vec<(String, u64, u64)>> {
+        sys::api::mountlist()
+            .ok()
+            .map(|ms| ms.into_iter().map(|m| (m.path, m.kind, m.dev)).collect())
+    }
 }
 
 /// Naked entry: the kernel hands us a 16-byte-aligned RSP, but a

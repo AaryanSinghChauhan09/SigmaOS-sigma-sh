@@ -171,6 +171,19 @@ pub trait System {
     fn statfs(&self, _path: &str) -> Option<(u64, u64)> {
         None
     }
+    /// mount(2): mount `fstype` from `source` at `target`.
+    /// Default: unsupported (Err string).
+    fn mount(&self, _source: &str, _target: &str, _fstype: &str) -> Result<(), String> {
+        Err("mount: unsupported".into())
+    }
+    /// umount(2): unmount the filesystem at `target`.
+    fn umount(&self, _target: &str) -> Result<(), String> {
+        Err("umount: unsupported".into())
+    }
+    /// Mount table entries (path, kind, dev). Default: unsupported.
+    fn mountlist(&self) -> Option<Vec<(String, u64, u64)>> {
+        None
+    }
 }
 
 /// A parsed command line.
@@ -2269,6 +2282,8 @@ where
             "unalias" => self.cmd_unalias(&args),
             "free" => self.cmd_free(&args),
             "df" => self.cmd_df(&args),
+            "mount" => self.cmd_mount(&args),
+            "umount" => self.cmd_umount(&args),
             "nproc" => self.cmd_nproc(&args),
             "ps" => self.cmd_ps(),
             "time" | "uptime" => self.emit(&format_u64(self.sys.uptime())),
@@ -4504,6 +4519,55 @@ where
         }
     }
 
+    /// `mount` — list mounts; `mount SRC TGT FSTYPE` — mount a filesystem.
+    fn cmd_mount(&mut self, args: &[String]) {
+        match args.len() {
+            0 => match self.sys.mountlist() {
+                Some(mounts) => {
+                    self.emit("Filesystem     Type");
+                    for (path, kind, _dev) in mounts {
+                        let name = match kind {
+                            1 => "initramfs",
+                            2 => "fat32",
+                            _ => "other",
+                        };
+                        self.emit(&format!("{:<14} {}", path, name));
+                    }
+                }
+                None => {
+                    self.emit("mount: unsupported");
+                    self.last_ok = false;
+                }
+            },
+            3 => {
+                if let Err(e) = self.sys.mount(&args[0], &args[1], &args[2]) {
+                    self.emit(&e);
+                    self.last_ok = false;
+                }
+            }
+            _ => {
+                self.emit("usage: mount [SRC TARGET FSTYPE]");
+                self.last_ok = false;
+            }
+        }
+    }
+
+    /// `umount TARGET` — unmount the filesystem at TARGET.
+    fn cmd_umount(&mut self, args: &[String]) {
+        match args.first() {
+            Some(target) => {
+                if let Err(e) = self.sys.umount(target) {
+                    self.emit(&e);
+                    self.last_ok = false;
+                }
+            }
+            None => {
+                self.emit("usage: umount TARGET");
+                self.last_ok = false;
+            }
+        }
+    }
+
     /// `nproc [--all]` — number of processing units (SigmaOS: 1).
     fn cmd_nproc(&mut self, _args: &[String]) {
         self.emit("1");
@@ -4763,11 +4827,11 @@ const BUILTIN_NAMES: &[&str] = &[
     "command", "continue", "cp", "cut", "dirname", "dirs", "dmesg", "df", "echo", "env", "exec",
     "exit", "expand", "export", "false", "fc", "fg", "find", "fold", "fork", "free", "grep",
     "groups", "head", "help", "history", "hostname", "id", "jobs", "kill", "launch", "local",
-    "logout", "ls", "mem", "mkdir", "mv", "nl", "nproc", "od", "paste", "popd", "printenv",
-    "printf", "ps", "pushd", "pwd", "quit", "read", "readonly", "reboot", "return", "rm", "rmdir",
-    "run", "seq", "set", "shift", "sleep", "sort", "source", "tail", "tee", "test", "time",
-    "times", "touch", "tr", "true", "tty", "unalias", "uname", "unexpand", "uniq", "unset",
-    "uptime", "wait", "wc", "which", "whoami", "xargs", "yes",
+    "logout", "ls", "mem", "mkdir", "mount", "mv", "nl", "nproc", "od", "paste", "popd",
+    "printenv", "printf", "ps", "pushd", "pwd", "quit", "read", "readonly", "reboot", "return",
+    "rm", "rmdir", "run", "seq", "set", "shift", "sleep", "sort", "source", "tail", "tee", "test",
+    "time", "times", "touch", "tr", "true", "tty", "umount", "unalias", "uname", "unexpand",
+    "uniq", "unset", "uptime", "wait", "wc", "which", "whoami", "xargs", "yes",
 ];
 
 fn is_builtin(name: &str) -> bool {
