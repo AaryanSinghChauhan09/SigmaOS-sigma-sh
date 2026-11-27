@@ -2330,6 +2330,8 @@ where
                 self.params.drain(..n);
             }
             "command" => self.cmd_command(&args),
+            "builtin" => self.cmd_builtin(&args),
+            "type" => self.cmd_type(&args),
             "readonly" => self.cmd_readonly(&args),
             "local" => self.cmd_local(&args),
             "." | "source" => self.cmd_source(&args),
@@ -2360,6 +2362,64 @@ where
         }
         self.pending_stdin = None;
         self.redirect = prev_redir;
+    }
+
+    /// `type NAME...` — describe how each name would be resolved:
+    /// alias, function, builtin, or PATH file (bash `type`).
+    fn cmd_type(&mut self, args: &[String]) {
+        if args.is_empty() {
+            self.emit("type: usage: type NAME...");
+            self.last_ok = false;
+            return;
+        }
+        for name in args {
+            if let Some((_, exp)) = self.aliases.iter().find(|(n, _)| n == name) {
+                self.emit(&format!("{} is aliased to `{}`", name, exp));
+                continue;
+            }
+            if self.functions.iter().any(|(n, _)| n == name) {
+                self.emit(&format!("{} is a function", name));
+                continue;
+            }
+            if is_builtin(name) {
+                self.emit(&format!("{} is a shell builtin", name));
+                continue;
+            }
+            // PATH lookup like `which`.
+            let found = Self::WHICH_PATH.iter().find_map(|dir| {
+                let p = format!("{}/{}", dir, name);
+                let (d, b) = p.rsplit_once('/')?;
+                self.fs
+                    .list(d)
+                    .is_some_and(|names| names.iter().any(|n| n == b))
+                    .then_some(p)
+            });
+            match found {
+                Some(p) => self.emit(&format!("{} is {}", name, p)),
+                None => {
+                    self.emit(&format!("type: {}: not found", name));
+                    self.last_ok = false;
+                }
+            }
+        }
+    }
+
+    /// `builtin NAME [ARGS...]` — run NAME as a builtin, bypassing
+    /// function lookup; errors if NAME isn't a builtin.
+    fn cmd_builtin(&mut self, args: &[String]) {
+        let Some(name) = args.first() else {
+            self.emit("builtin: usage: builtin NAME [ARGS...]");
+            self.last_ok = false;
+            return;
+        };
+        if !is_builtin(name) {
+            self.emit(&format!("builtin: {}: not a shell builtin", name));
+            self.last_ok = false;
+            return;
+        }
+        // cmd_command already does [name, rest...] dispatch with
+        // function lookup suppressed.
+        self.cmd_command(args);
     }
 
     /// `command NAME [ARGS...]` — run NAME bypassing function lookup
@@ -4669,6 +4729,24 @@ fn glob_match(pat: &str, name: &str) -> bool {
         }
     }
     true
+}
+
+/// Names handled by the builtin dispatch in execute_single_command.
+/// Kept in sync with the match arms; used by `type`/`builtin`.
+const BUILTIN_NAMES: &[&str] = &[
+    ".", ":", "?", "[", "alias", "arch", "basename", "bg", "break", "cat", "cd", "clear",
+    "command", "continue", "cp", "cut", "dirname", "dirs", "dmesg", "echo", "env", "exec", "exit",
+    "expand", "export", "false", "fc", "fg", "find", "fold", "fork", "free", "grep", "groups",
+    "head", "help", "history", "hostname", "id", "jobs", "kill", "launch", "local", "logout", "ls",
+    "mem", "mkdir", "mv", "nl", "nproc", "od", "paste", "popd", "printenv", "printf", "ps",
+    "pushd", "pwd", "quit", "read", "readonly", "reboot", "return", "rm", "rmdir", "run", "seq",
+    "set", "shift", "sleep", "sort", "source", "tail", "tee", "test", "time", "times", "touch",
+    "tr", "true", "tty", "unalias", "uname", "unexpand", "uniq", "unset", "uptime", "wait", "wc",
+    "which", "whoami", "xargs", "yes",
+];
+
+fn is_builtin(name: &str) -> bool {
+    BUILTIN_NAMES.contains(&name)
 }
 
 fn format_u64(v: u64) -> String {
