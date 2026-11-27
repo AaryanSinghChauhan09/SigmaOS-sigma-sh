@@ -2194,7 +2194,7 @@ where
             "true" | ":" => {}
             "false" => self.last_ok = false,
             "clear" => self.io.write("\x1b[2J\x1b[H"),
-            "echo" => self.emit(&args.join(" ")),
+            "echo" => self.cmd_echo(&args),
             "pwd" => {
                 let c = self.cwd.clone();
                 self.emit(&c);
@@ -3935,6 +3935,36 @@ where
         self.emit(&parts.join(" "));
     }
 
+    /// `echo [-n] [-e] [-E] [--] [args...]` — POSIX echo with flag
+    /// handling and backslash escapes under -e.
+    fn cmd_echo(&mut self, args: &[String]) {
+        let mut newline = true;
+        let mut escapes = false;
+        let mut i = 0usize;
+        while i < args.len() {
+            match args[i].as_str() {
+                "-n" => newline = false,
+                "-e" => escapes = true,
+                "-E" => escapes = false,
+                "--" => {
+                    i += 1;
+                    break;
+                }
+                _ => break,
+            }
+            i += 1;
+        }
+        let mut s = args[i..].join(" ");
+        if escapes {
+            s = unescape_echo(&s);
+        }
+        if newline {
+            self.emit(&s);
+        } else {
+            self.emit_raw(&s);
+        }
+    }
+
     /// `printenv [NAME]` — print env values (no `NAME=` prefix).
     fn cmd_printenv(&mut self, args: &[String]) {
         if let Some(name) = args.first() {
@@ -4599,6 +4629,49 @@ fn glob_match(pat: &str, name: &str) -> bool {
 
 fn format_u64(v: u64) -> String {
     v.to_string()
+}
+
+/// Backslash escapes for `echo -e`: \n \t \\ \r \b \f \v \a \0NNN.
+fn unescape_echo(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] != '\\' || i + 1 >= chars.len() {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        match chars[i] {
+            'n' => out.push('\n'),
+            't' => out.push('\t'),
+            'r' => out.push('\r'),
+            'b' => out.push('\u{8}'),
+            'f' => out.push('\u{c}'),
+            'v' => out.push('\u{b}'),
+            'a' => out.push('\u{7}'),
+            '0'..='7' => {
+                // \0NNN octal (up to 3 digits after the leading 0).
+                let mut val = 0u32;
+                let mut n = 0;
+                while n < 3 && i < chars.len() && ('0'..='7').contains(&chars[i]) {
+                    val = val * 8 + chars[i].to_digit(8).unwrap();
+                    i += 1;
+                    n += 1;
+                }
+                if let Some(c) = char::from_u32(val) {
+                    out.push(c);
+                }
+                // i already sits past the digits; undo the shared
+                // i += 1 at the loop bottom.
+                i -= 1;
+            }
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    out
 }
 
 #[cfg(test)]
