@@ -348,6 +348,10 @@ impl System for SysSystem {
             Err(_) => None,
         }
     }
+
+    fn statfs(&self, path: &str) -> Option<(u64, u64)> {
+        sys::api::statfs(path).ok()
+    }
 }
 
 /// Naked entry: the kernel hands us a 16-byte-aligned RSP, but a

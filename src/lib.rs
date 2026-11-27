@@ -167,6 +167,10 @@ pub trait System {
     fn dmesg(&self) -> Option<String> {
         None
     }
+    /// statfs(2) for `path`: (kind, node_count). Default: unsupported.
+    fn statfs(&self, _path: &str) -> Option<(u64, u64)> {
+        None
+    }
 }
 
 /// A parsed command line.
@@ -2264,6 +2268,7 @@ where
             "alias" => self.cmd_alias(&args),
             "unalias" => self.cmd_unalias(&args),
             "free" => self.cmd_free(&args),
+            "df" => self.cmd_df(&args),
             "nproc" => self.cmd_nproc(&args),
             "ps" => self.cmd_ps(),
             "time" | "uptime" => self.emit(&format_u64(self.sys.uptime())),
@@ -4479,6 +4484,26 @@ where
         ));
     }
 
+    /// `df [path]` — filesystem usage report (default: cwd's fs).
+    fn cmd_df(&mut self, args: &[String]) {
+        let path = self.resolve(args.first());
+        match self.sys.statfs(&path) {
+            Some((kind, nodes)) => {
+                let name = match kind {
+                    1 => "initramfs",
+                    2 => "fat32",
+                    _ => "other",
+                };
+                self.emit("Filesystem     Type       Files");
+                self.emit(&format!("{:<14} {:<10} {}", path, name, nodes));
+            }
+            None => {
+                self.emit("df: statfs unsupported");
+                self.last_ok = false;
+            }
+        }
+    }
+
     /// `nproc [--all]` — number of processing units (SigmaOS: 1).
     fn cmd_nproc(&mut self, _args: &[String]) {
         self.emit("1");
@@ -4735,14 +4760,14 @@ fn glob_match(pat: &str, name: &str) -> bool {
 /// Kept in sync with the match arms; used by `type`/`builtin`.
 const BUILTIN_NAMES: &[&str] = &[
     ".", ":", "?", "[", "alias", "arch", "basename", "bg", "break", "cat", "cd", "clear",
-    "command", "continue", "cp", "cut", "dirname", "dirs", "dmesg", "echo", "env", "exec", "exit",
-    "expand", "export", "false", "fc", "fg", "find", "fold", "fork", "free", "grep", "groups",
-    "head", "help", "history", "hostname", "id", "jobs", "kill", "launch", "local", "logout", "ls",
-    "mem", "mkdir", "mv", "nl", "nproc", "od", "paste", "popd", "printenv", "printf", "ps",
-    "pushd", "pwd", "quit", "read", "readonly", "reboot", "return", "rm", "rmdir", "run", "seq",
-    "set", "shift", "sleep", "sort", "source", "tail", "tee", "test", "time", "times", "touch",
-    "tr", "true", "tty", "unalias", "uname", "unexpand", "uniq", "unset", "uptime", "wait", "wc",
-    "which", "whoami", "xargs", "yes",
+    "command", "continue", "cp", "cut", "dirname", "dirs", "dmesg", "df", "echo", "env", "exec",
+    "exit", "expand", "export", "false", "fc", "fg", "find", "fold", "fork", "free", "grep",
+    "groups", "head", "help", "history", "hostname", "id", "jobs", "kill", "launch", "local",
+    "logout", "ls", "mem", "mkdir", "mv", "nl", "nproc", "od", "paste", "popd", "printenv",
+    "printf", "ps", "pushd", "pwd", "quit", "read", "readonly", "reboot", "return", "rm", "rmdir",
+    "run", "seq", "set", "shift", "sleep", "sort", "source", "tail", "tee", "test", "time",
+    "times", "touch", "tr", "true", "tty", "unalias", "uname", "unexpand", "uniq", "unset",
+    "uptime", "wait", "wc", "which", "whoami", "xargs", "yes",
 ];
 
 fn is_builtin(name: &str) -> bool {
