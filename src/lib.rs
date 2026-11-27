@@ -2191,6 +2191,8 @@ where
             "read" => self.cmd_read(&args),
             "kill" => self.cmd_kill(&args),
             "uname" => self.emit(self.sys.uname()),
+            "arch" => self.emit("x86_64"),
+            "hostname" => self.cmd_hostname(&args),
             "mem" => self.cmd_mem(),
             "ps" => self.cmd_ps(),
             "time" | "uptime" => self.emit(&format_u64(self.sys.uptime())),
@@ -2615,6 +2617,8 @@ where
             "  sleep <secs>     pause execution",
             "  kill [-9] <pid>  terminate a process",
             "  uname            print OS name",
+            "  arch             print machine arch",
+            "  hostname [name]  print or set hostname",
             "  true/:/false    no-op / fail (for && and ||)",
             "  clear           clear the screen",
             "  mem             memory usage",
@@ -3810,6 +3814,28 @@ where
                 self.set_var(k, &v);
             }
             self.readonly_vars.push(k.to_string());
+        }
+    }
+
+    /// `hostname [name]` — print or set the system hostname
+    /// (backed by /etc/hostname in the initramfs).
+    fn cmd_hostname(&mut self, args: &[String]) {
+        match args.first() {
+            None => match self.fs.read_to_string("/etc/hostname") {
+                Some(h) => self.emit(h.trim_end()),
+                None => self.emit("sigmaos"),
+            },
+            Some(name) => {
+                if self
+                    .fs
+                    .write_file("/etc/hostname", &format!("{}\n", name), false)
+                {
+                    self.last_ok = true;
+                } else {
+                    self.last_ok = false;
+                    self.emit("hostname: cannot write /etc/hostname");
+                }
+            }
         }
     }
 
@@ -5380,5 +5406,14 @@ mod tests {
         for want in ["got-red", "sourced-42", "after-42"] {
             assert!(o.contains(want), "missing {want} OUT: {o}");
         }
+    }
+
+    #[test]
+    fn hostname_and_arch() {
+        let (mut sh, out) = shell(&["hostname", "hostname newbox", "arch", "exit"]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("sigmaos"), "OUT: {o}");
+        assert!(o.contains("x86_64"), "OUT: {o}");
     }
 }
