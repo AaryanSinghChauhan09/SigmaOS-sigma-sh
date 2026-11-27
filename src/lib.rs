@@ -529,6 +529,42 @@ fn arith_eval(expr: &str, env: &[(String, String)]) -> String {
     p.expr().to_string()
 }
 
+/// `${var#pat}`/`${var##pat}`/`${var%pat}`/`${var%%pat}` — remove the
+/// shortest (`#`,`%`) or longest (`##`,`%%`) leading/trailing affix
+/// matching the glob `pat`.
+fn trim_affix(v: &str, pat: &str, op: &str) -> String {
+    let chars: Vec<char> = v.chars().collect();
+    let n = chars.len();
+    let longest = op.len() == 2;
+    let prefix = op.starts_with('#');
+    let mut best: Option<usize> = None;
+    // affix length k: 0..=n; for `#` the affix is chars[..k],
+    // for `%` it is chars[n-k..].
+    for k in 0..=n {
+        let affix: String = if prefix {
+            chars[..k].iter().collect()
+        } else {
+            chars[n - k..].iter().collect()
+        };
+        if glob_match(pat, &affix) {
+            best = Some(k);
+            if !longest {
+                break;
+            }
+        }
+    }
+    match best {
+        Some(0) | None => v.to_string(),
+        Some(k) => {
+            if prefix {
+                chars[k..].iter().collect()
+            } else {
+                chars[..n - k].iter().collect()
+            }
+        }
+    }
+}
+
 /// Strip one layer of matching surrounding single/double quotes.
 fn unquote(s: &str) -> String {
     let t = s.trim();
@@ -548,7 +584,7 @@ fn split_case_pats(s: &str) -> Vec<String> {
     let mut in_d = false;
     let mut in_s = false;
     let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
+    for c in chars.by_ref() {
         match c {
             '"' if !in_s => {
                 in_d = !in_d;
@@ -1354,7 +1390,7 @@ where
                 let segs = split_pipe_str(line);
                 if let Some(last) = segs.last() {
                     if matches!(
-                        last.trim_start().split_whitespace().next(),
+                        last.split_whitespace().next(),
                         Some("if" | "for" | "while" | "until" | "case")
                     ) {
                         let commands: Vec<Command> = segs.iter().filter_map(|s| parse(s)).collect();
@@ -1821,7 +1857,10 @@ where
             }
         }
         // Find the earliest operator; names can't contain op chars.
-        const OPS: [&str; 8] = [":-", ":=", ":?", ":+", "-", "=", "?", "+"];
+        // `##`/`%%` must precede `#`/`%` for longest-match at same pos.
+        const OPS: [&str; 12] = [
+            ":-", ":=", ":?", ":+", "-", "=", "?", "+", "##", "%%", "#", "%",
+        ];
         let mut split = None;
         for (idx, _) in inner.char_indices() {
             for op in OPS {
@@ -1864,6 +1903,7 @@ where
                     String::new()
                 }
             }
+            "#" | "##" | "%" | "%%" => trim_affix(&val.unwrap_or_default(), &word, op),
             ":?" | "?" => {
                 if nonempty || (op == "?" && val.is_some()) {
                     val.unwrap_or_default()
@@ -5157,5 +5197,22 @@ mod tests {
         assert!(o.contains("dflt \n"), "OUT: {o}");
         assert!(!o.contains("dflt2"), "OUT: {o}");
         assert!(!o.contains("NO"), "OUT: {o}");
+    }
+
+    #[test]
+    fn brace_trim_ops() {
+        let (mut sh, out) = shell(&[
+            "p=/a/b/c.txt",
+            "echo ${p#*/} ${p##*/} ${p%.txt} ${p%%.*}",
+            "echo ${p#*.} ${p%/*}",
+            "n=foo.tar.gz",
+            "echo ${n%.gz} ${n%%.*} ${n#*.}",
+            "exit",
+        ]);
+        sh.run();
+        let o = out.borrow();
+        for want in ["a/b/c.txt c.txt", "b/c.txt c.txt", "foo.tar foo tar.gz"] {
+            assert!(o.contains(want), "missing {want} OUT: {o}");
+        }
     }
 }
