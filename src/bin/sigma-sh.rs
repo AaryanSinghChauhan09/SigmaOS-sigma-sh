@@ -183,6 +183,11 @@ impl System for StdSys {
         -1
     }
 
+    fn exec(&self, _path: &str, _args: &[String], _env: &[String]) -> Result<(), String> {
+        // Host build: process replacement isn't meaningful here.
+        Err("exec: unsupported on host".into())
+    }
+
     fn kill(&self, pid: i64, sig: &str) -> bool {
         Proc::new("kill")
             .arg("-s")

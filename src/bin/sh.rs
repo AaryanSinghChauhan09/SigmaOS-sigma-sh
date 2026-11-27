@@ -303,6 +303,12 @@ impl System for SysSystem {
         sigma_sys::api::fork().unwrap_or(-1)
     }
 
+    fn exec(&self, path: &str, args: &[String], env: &[String]) -> Result<(), String> {
+        let arg_refs: Vec<&str> = args.iter().map(|a| a.as_str()).collect();
+        let env_refs: Vec<&str> = env.iter().map(|e| e.as_str()).collect();
+        sigma_sys::api::exec(path, &arg_refs, &env_refs).map_err(|e| format!("exec failed ({})", e))
+    }
+
     fn kill(&self, pid: i64, sig: &str) -> bool {
         let code = sig.parse::<i64>().unwrap_or(match sig {
             "HUP" => 1,

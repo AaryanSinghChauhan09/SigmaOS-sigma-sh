@@ -137,6 +137,11 @@ pub trait System {
     fn fork(&self) -> i64 {
         -1
     }
+    /// exec(2): replace the current process image with `path`.
+    /// Never returns on success; `Err` on failure. Default: unsupported.
+    fn exec(&self, _path: &str, _args: &[String], _env: &[String]) -> Result<(), String> {
+        Err("exec: unsupported".into())
+    }
     /// Kernel/OS name for `uname`. Default: sigmaos.
     fn uname(&self) -> &'static str {
         "sigmaos"
@@ -2196,6 +2201,7 @@ where
             "read" => self.cmd_read(&args),
             "kill" => self.cmd_kill(&args),
             "fork" => self.cmd_fork(),
+            "exec" => self.cmd_exec(&args),
             "uname" => self.emit(self.sys.uname()),
             "arch" => self.emit("x86_64"),
             "hostname" => self.cmd_hostname(&args),
@@ -4100,6 +4106,46 @@ where
                 self.emit(&format!("launched {} (pid {})", prog, pid));
             }
             Err(e) => self.emit(&format!("launch: {}: {}", prog, e)),
+        }
+    }
+
+    /// `exec COMMAND [ARGS...]` — replace this shell with COMMAND.
+    /// On success the shell is gone (POSIX semantics); on failure an
+    /// error prints and the shell continues.
+    fn cmd_exec(&mut self, args: &[String]) {
+        let Some(prog) = args.first() else {
+            self.emit("exec: missing program");
+            self.last_ok = false;
+            return;
+        };
+        let resolved;
+        let prog = if prog.contains('/') {
+            prog.as_str()
+        } else {
+            resolved = Self::WHICH_PATH
+                .iter()
+                .find_map(|dir| {
+                    let p = format!("{}/{}", dir, prog);
+                    let (d, b) = p.rsplit_once('/')?;
+                    self.fs
+                        .list(d)
+                        .is_some_and(|names| names.iter().any(|n| n == b))
+                        .then_some(p)
+                })
+                .unwrap_or_else(|| prog.clone());
+            resolved.as_str()
+        };
+        let envp: alloc::vec::Vec<String> = self
+            .env
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect();
+        match self.sys.exec(prog, &args[1..], &envp) {
+            Ok(()) => {}
+            Err(e) => {
+                self.emit(&format!("exec: {}: {}", prog, e));
+                self.last_ok = false;
+            }
         }
     }
 
