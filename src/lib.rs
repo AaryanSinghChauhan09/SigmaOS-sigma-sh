@@ -2204,6 +2204,11 @@ where
             "cat" => self.cmd_cat(&args),
             "which" => self.cmd_which(&args),
             "history" => self.cmd_history(),
+            "fc" => self.cmd_fc(&args),
+            "times" => {
+                self.emit("0m0.00s 0m0.00s");
+                self.emit("0m0.00s 0m0.00s");
+            }
             "export" => self.cmd_export(&args),
             "unset" => self.cmd_unset(&args),
             "mkdir" => self.cmd_mkdir(&args),
@@ -2856,6 +2861,45 @@ where
             .collect();
         for l in lines {
             self.emit(&l);
+        }
+    }
+
+    /// `fc [-l] [n]` — fix command: bare `fc` re-runs the previous
+    /// history entry; `fc -l [n]` lists the last n (default 16).
+    fn cmd_fc(&mut self, args: &[String]) {
+        if args.first().is_some_and(|a| a == "-l") {
+            let n = args
+                .get(1)
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(16);
+            let start = self.history.len().saturating_sub(n);
+            let slice: Vec<String> = self.history[start..].to_vec();
+            for (i, h) in slice.iter().enumerate() {
+                self.emit(&format!("{:4}  {}", start + i + 1, h));
+            }
+            return;
+        }
+        if !args.is_empty() {
+            self.emit("fc: only -l and bare rerun are supported");
+            self.last_ok = false;
+            return;
+        }
+        // Rerun the most recent non-fc history entry.
+        let cmd = self
+            .history
+            .iter()
+            .rev()
+            .find(|h| !h.split_whitespace().next().is_some_and(|w| w == "fc"))
+            .cloned();
+        match cmd {
+            Some(c) => {
+                let c2 = c.clone();
+                self.execute(&c2);
+            }
+            None => {
+                self.emit("fc: history empty");
+                self.last_ok = false;
+            }
         }
     }
 
