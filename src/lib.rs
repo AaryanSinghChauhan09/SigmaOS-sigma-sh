@@ -1730,15 +1730,31 @@ where
                 }
                 continue;
             }
-            let name = if i + 1 < chars.len() && chars[i + 1] == '{' {
+            let (name, was_brace) = if i + 1 < chars.len() && chars[i + 1] == '{' {
+                // Match braces with nesting: `${a:-${b:-x}}`.
                 let mut j = i + 2;
                 let mut n = String::new();
-                while j < chars.len() && chars[j] != '}' {
+                let mut depth = 1usize;
+                while j < chars.len() && depth > 0 {
+                    if chars[j] == '$' && j + 1 < chars.len() && chars[j + 1] == '{' {
+                        depth += 1;
+                        n.push('$');
+                        n.push('{');
+                        j += 2;
+                        continue;
+                    }
+                    if chars[j] == '}' {
+                        depth -= 1;
+                        if depth == 0 {
+                            j += 1;
+                            break;
+                        }
+                    }
                     n.push(chars[j]);
                     j += 1;
                 }
-                i = j + 1;
-                n
+                i = j;
+                (n, true)
             } else {
                 let mut j = i + 1;
                 let mut n = String::new();
@@ -1747,10 +1763,14 @@ where
                     j += 1;
                 }
                 i = j;
-                n
+                (n, false)
             };
             if name.is_empty() {
                 out.push('$');
+                continue;
+            }
+            if was_brace {
+                out.push_str(&self.brace_expand(&name));
                 continue;
             }
             // Positional params `$1`..`$N` (and `${1}`).
@@ -1769,6 +1789,95 @@ where
             }
         }
         out
+    }
+
+    /// Value of a variable by name: positional `$N` or env lookup.
+    /// None = unset.
+    fn var_value(&self, name: &str) -> Option<String> {
+        if !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()) {
+            return name
+                .parse::<usize>()
+                .ok()
+                .filter(|&n| n >= 1)
+                .and_then(|n| self.params.get(n - 1).cloned());
+        }
+        self.env
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+    }
+
+    /// `${...}` expansion: plain `${name}`, `${#name}` length, and
+    /// `${name op word}` with POSIX operators `:-` `-` `:=` `=` `:+`
+    /// `+` `:?` `?`. The word is itself expanded.
+    fn brace_expand(&mut self, inner: &str) -> String {
+        // `${#name}` — length in characters.
+        if let Some(rest) = inner.strip_prefix('#') {
+            if !rest.is_empty() && rest.chars().all(|c| c == '_' || c.is_ascii_alphanumeric()) {
+                return self
+                    .var_value(rest)
+                    .map(|v| v.chars().count().to_string())
+                    .unwrap_or_else(|| "0".to_string());
+            }
+        }
+        // Find the earliest operator; names can't contain op chars.
+        const OPS: [&str; 8] = [":-", ":=", ":?", ":+", "-", "=", "?", "+"];
+        let mut split = None;
+        for (idx, _) in inner.char_indices() {
+            for op in OPS {
+                if inner[idx..].starts_with(op) {
+                    split = Some((idx, op));
+                    break;
+                }
+            }
+            if split.is_some() {
+                break;
+            }
+        }
+        let Some((pos, op)) = split else {
+            return self.var_value(inner).unwrap_or_default();
+        };
+        let name = &inner[..pos];
+        let word = self.expand(&inner[pos + op.len()..]);
+        let val = self.var_value(name);
+        let nonempty = val.as_deref().is_some_and(|v| !v.is_empty());
+        match op {
+            ":-" | "-" => {
+                if nonempty || (op == "-" && val.is_some()) {
+                    val.unwrap_or_default()
+                } else {
+                    word
+                }
+            }
+            ":=" | "=" => {
+                if nonempty || (op == "=" && val.is_some()) {
+                    val.unwrap_or_default()
+                } else {
+                    self.set_var(name, &word);
+                    word
+                }
+            }
+            ":+" | "+" => {
+                if nonempty || (op == "+" && val.is_some()) {
+                    word
+                } else {
+                    String::new()
+                }
+            }
+            ":?" | "?" => {
+                if nonempty || (op == "?" && val.is_some()) {
+                    val.unwrap_or_default()
+                } else {
+                    self.last_ok = false;
+                    self.emit(&format!(
+                        "{}: {}: parameter null or not set",
+                        "sigma-sh", name
+                    ));
+                    String::new()
+                }
+            }
+            _ => unreachable!(),
+        }
     }
 
     /// Run `line` capturing stdout text for `$(...)` substitution.
@@ -5024,5 +5133,29 @@ mod tests {
         for want in ["got-one", "got-two", "got-three", "A=aa", "B=bb", "C=cc"] {
             assert!(o.contains(want), "missing {want} OUT: {o}");
         }
+    }
+
+    #[test]
+    fn brace_param_expansion() {
+        let (mut sh, out) = shell(&[
+            "echo ${unset:-dflt}",
+            "e=",
+            "echo ${e:-dflt} ${e-dflt2}",
+            "v=hi",
+            "echo ${v:+ALT} ${unset:+NO}",
+            "echo ${#v} ${#unset}",
+            "echo ${newvar:=assigned} $newvar",
+            "echo ${v:?} end",
+            "exit",
+        ]);
+        sh.run();
+        let o = out.borrow();
+        for want in ["dflt", "ALT", " 0", "2 0", "assigned assigned", "hi end"] {
+            assert!(o.contains(want), "missing {want} OUT: {o}");
+        }
+        // `${e-dflt2}` with e set-but-empty yields "" per POSIX.
+        assert!(o.contains("dflt \n"), "OUT: {o}");
+        assert!(!o.contains("dflt2"), "OUT: {o}");
+        assert!(!o.contains("NO"), "OUT: {o}");
     }
 }
