@@ -183,6 +183,267 @@ pub struct Pipeline {
     pub commands: Vec<Command>,
 }
 
+// ── compound commands (if/for/while) ──────────────────────────────
+
+/// One token in a compound command: a shell keyword or a command
+/// fragment (a `;`-separated part, possibly with leading keyword
+/// already stripped).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CTok {
+    Kw(&'static str),
+    Cmd(String),
+}
+
+/// Parsed compound command tree. `Cmd` nodes run through the normal
+/// executor; conditions evaluate to `last_ok`.
+#[derive(Debug)]
+enum CNode {
+    Cmd(String),
+    If {
+        arms: Vec<(Vec<CNode>, Vec<CNode>)>, // (cond, body) per branch
+        else_body: Option<Vec<CNode>>,
+    },
+    For {
+        var: String,
+        items: Option<Vec<String>>, // None = iterate "$@"
+        body: Vec<CNode>,
+    },
+    Loop {
+        until: bool,
+        cond: Vec<CNode>,
+        body: Vec<CNode>,
+    },
+}
+
+/// Compound keywords recognized at the start of a `;`-part.
+const CKWS: [&str; 10] = [
+    "if", "then", "elif", "else", "fi", "for", "while", "until", "do", "done",
+];
+
+/// Split `;`-parts into compound tokens. A part like `then echo x`
+/// yields Kw(then) + Cmd("echo x"); a bare `fi` yields just Kw(fi).
+fn compound_tokens(parts: &[String]) -> Vec<CTok> {
+    let mut out = Vec::new();
+    for part in parts {
+        let mut rest = part.trim();
+        // Strip leading keywords repeatedly: `then for x in a` is
+        // Kw(then) + Kw(for) + Cmd("x in a") — nested compounds glue
+        // onto the previous keyword's part.
+        loop {
+            let mut stripped = false;
+            for &kw in &CKWS {
+                if rest == kw {
+                    out.push(CTok::Kw(kw));
+                    rest = "";
+                    stripped = true;
+                    break;
+                }
+                // Keyword must be followed by whitespace — `ifconfig`
+                // stays a command.
+                if let Some(r) = rest.strip_prefix(kw).and_then(|r| r.strip_prefix(' ')) {
+                    out.push(CTok::Kw(kw));
+                    rest = r.trim_start();
+                    stripped = true;
+                    break;
+                }
+            }
+            if !stripped {
+                break;
+            }
+        }
+        if !rest.is_empty() {
+            out.push(CTok::Cmd(rest.to_string()));
+        }
+    }
+    out
+}
+
+/// Recursive-descent parser for compound commands over CToks.
+struct CParser<'a> {
+    toks: &'a [CTok],
+    i: usize,
+}
+
+impl<'a> CParser<'a> {
+    fn peek(&self) -> Option<&'a CTok> {
+        self.toks.get(self.i)
+    }
+    fn bump(&mut self) -> Option<&'a CTok> {
+        let t = self.toks.get(self.i);
+        if t.is_some() {
+            self.i += 1;
+        }
+        t
+    }
+    fn at_kw(&self, kw: &str) -> bool {
+        matches!(self.peek(), Some(CTok::Kw(k)) if *k == kw)
+    }
+
+    /// Parse a block of nodes until one of `stops` (not consumed).
+    /// Returns the nodes and the stop keyword hit (None = EOF).
+    fn block(&mut self, stops: &[&str]) -> (Vec<CNode>, Option<&'static str>) {
+        let mut nodes = Vec::new();
+        loop {
+            match self.peek() {
+                None => return (nodes, None),
+                Some(CTok::Kw(k)) if stops.contains(k) => return (nodes, Some(k)),
+                Some(CTok::Kw("if")) => {
+                    self.bump();
+                    match self.if_node() {
+                        Some(n) => nodes.push(n),
+                        None => return (nodes, None),
+                    }
+                }
+                Some(CTok::Kw("for")) => {
+                    self.bump();
+                    match self.for_node() {
+                        Some(n) => nodes.push(n),
+                        None => return (nodes, None),
+                    }
+                }
+                Some(CTok::Kw("while")) | Some(CTok::Kw("until")) => {
+                    let until = matches!(self.peek(), Some(CTok::Kw("until")));
+                    self.bump();
+                    match self.loop_node(until) {
+                        Some(n) => nodes.push(n),
+                        None => return (nodes, None),
+                    }
+                }
+                Some(CTok::Kw(k)) => {
+                    // Stray keyword — syntax error; emit as a command
+                    // so the user sees it fail rather than hang.
+                    let k = *k;
+                    self.bump();
+                    nodes.push(CNode::Cmd(k.to_string()));
+                }
+                Some(CTok::Cmd(_)) => {
+                    if let Some(CTok::Cmd(c)) = self.bump() {
+                        nodes.push(CNode::Cmd(c.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    /// After Kw(if): parse arms until fi. Caller already consumed `if`.
+    fn if_node(&mut self) -> Option<CNode> {
+        let mut arms = Vec::new();
+        let mut else_body = None;
+        loop {
+            // condition: nodes until `then`
+            let (cond, stop) = self.block(&["then"]);
+            if stop != Some("then") {
+                return None; // missing then
+            }
+            self.bump(); // consume then
+            let (body, stop2) = self.block(&["elif", "else", "fi"]);
+            arms.push((cond, body));
+            match stop2 {
+                Some("elif") => {
+                    self.bump();
+                    continue;
+                }
+                Some("else") => {
+                    self.bump();
+                    let (b, s) = self.block(&["fi"]);
+                    if s != Some("fi") {
+                        return None;
+                    }
+                    else_body = Some(b);
+                    self.bump(); // consume fi
+                    return Some(CNode::If { arms, else_body });
+                }
+                Some("fi") => {
+                    self.bump();
+                    return Some(CNode::If { arms, else_body });
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// After Kw(for): `for VAR [in items]; do BODY; done`.
+    fn for_node(&mut self) -> Option<CNode> {
+        // spec: Cmd("VAR in item item ...") or Cmd("VAR")
+        let spec = match self.bump() {
+            Some(CTok::Cmd(c)) => c.clone(),
+            _ => return None,
+        };
+        let mut words = spec.split_whitespace();
+        let var = words.next()?.to_string();
+        if var.is_empty()
+            || !var
+                .chars()
+                .enumerate()
+                .all(|(i, c)| c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit()))
+        {
+            return None;
+        }
+        let items = match words.next() {
+            None => None, // `for VAR; do` -> iterate "$@"
+            Some("in") => {
+                let rest = spec.split_once(" in ").map(|(_, r)| r).unwrap_or("");
+                if rest.is_empty() {
+                    Some(Vec::new())
+                } else {
+                    Some(split_items(rest))
+                }
+            }
+            Some(_) => return None, // `for x y` invalid
+        };
+        if !self.at_kw("do") {
+            return None;
+        }
+        self.bump(); // do
+        let (body, stop) = self.block(&["done"]);
+        if stop != Some("done") {
+            return None;
+        }
+        self.bump(); // done
+        Some(CNode::For { var, items, body })
+    }
+
+    /// After Kw(while)/Kw(until): `COND; do BODY; done`.
+    fn loop_node(&mut self, until: bool) -> Option<CNode> {
+        let (cond, stop) = self.block(&["do"]);
+        if stop != Some("do") {
+            return None;
+        }
+        self.bump(); // do
+        let (body, stop2) = self.block(&["done"]);
+        if stop2 != Some("done") {
+            return None;
+        }
+        self.bump(); // done
+        Some(CNode::Loop { until, cond, body })
+    }
+}
+
+/// Quote-aware word split for `for ... in` item lists. Returns
+/// (word, quoted-mask) pairs; quotes are stripped.
+fn split_items(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_d = false;
+    let mut in_s = false;
+    for c in s.chars() {
+        match c {
+            '"' if !in_s => in_d = !in_d,
+            '\'' if !in_d => in_s = !in_s,
+            c if c.is_whitespace() && !in_d && !in_s => {
+                if !cur.is_empty() {
+                    out.push(core::mem::take(&mut cur));
+                }
+            }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 /// Tokenize a command line: whitespace-separated, single- and
 /// double-quote aware (quotes are stripped from the resulting args).
 pub fn parse(line: &str) -> Option<Command> {
@@ -688,6 +949,12 @@ pub struct Shell<I, F, P, M, S> {
     pub fn_depth: usize,
     /// Set by `command` — bypasses function lookup for one dispatch.
     pub in_command: bool,
+    /// >0 while executing a loop body (gates `break`/`continue`).
+    pub loop_depth: usize,
+    /// Set by `break`; consumed by the innermost enclosing loop.
+    pub brk_flag: bool,
+    /// Set by `continue`; consumed by the innermost enclosing loop.
+    pub cont_flag: bool,
 }
 
 impl<I, F, P, M, S> Shell<I, F, P, M, S>
@@ -725,6 +992,9 @@ where
             ret_flag: false,
             fn_depth: 0,
             in_command: false,
+            loop_depth: 0,
+            brk_flag: false,
+            cont_flag: false,
         }
     }
 
@@ -754,6 +1024,43 @@ where
             self.functions.retain(|(n, _)| *n != name);
             self.functions.push((name, body));
             return;
+        }
+        // Whole-line `VAR=value [VAR2=value2 ...]` assignments.
+        if self.try_assignments(line) {
+            return;
+        }
+        // Compound commands: `if/for/while/until` opening a `;`-list.
+        let first_word = line.split_whitespace().next().unwrap_or("");
+        if matches!(first_word, "if" | "for" | "while" | "until") {
+            let parts = split_semicolons(line);
+            let toks = compound_tokens(&parts);
+            let mut p = CParser { toks: &toks, i: 0 };
+            let first = match p.peek() {
+                Some(CTok::Kw("if")) => {
+                    p.bump();
+                    p.if_node()
+                }
+                Some(CTok::Kw("for")) => {
+                    p.bump();
+                    p.for_node()
+                }
+                Some(CTok::Kw("while")) | Some(CTok::Kw("until")) => {
+                    let until = matches!(p.peek(), Some(CTok::Kw("until")));
+                    p.bump();
+                    p.loop_node(until)
+                }
+                _ => None,
+            };
+            if let Some(node) = first {
+                // Trailing `; cmd` after fi/done parses as more nodes.
+                let (rest, _) = p.block(&[]);
+                let mut nodes = alloc::vec![node];
+                nodes.extend(rest);
+                self.exec_cnodes(&nodes);
+                return;
+            }
+            // Parse failed — fall through; keywords become
+            // command-not-found errors like bash's syntax error.
         }
         // `;` separates commands (quote-aware). A lone trailing `;`
         // also counts — otherwise parse() would keep it as an arg.
@@ -1432,6 +1739,22 @@ where
                 self.params.drain(..n);
             }
             "command" => self.cmd_command(&args),
+            "break" => {
+                if self.loop_depth == 0 {
+                    self.last_ok = false;
+                    self.emit("break: only meaningful inside a loop");
+                } else {
+                    self.brk_flag = true;
+                }
+            }
+            "continue" => {
+                if self.loop_depth == 0 {
+                    self.last_ok = false;
+                    self.emit("continue: only meaningful inside a loop");
+                } else {
+                    self.cont_flag = true;
+                }
+            }
             "reboot" => self.sys.reboot(),
             "jobs" => self.cmd_jobs(),
             "fg" => self.cmd_fg(&args),
@@ -1464,6 +1787,136 @@ where
         self.in_command = true;
         self.execute_single_command(&c);
         self.in_command = false;
+    }
+
+    /// If `line` consists solely of `NAME=value` words, set the env
+    /// vars (values get `$`/`$()` expansion) and return true.
+    fn try_assignments(&mut self, line: &str) -> bool {
+        let Some(c) = parse(line) else {
+            return false;
+        };
+        let mut toks = alloc::vec![c.name.as_str()];
+        toks.extend(c.args.iter().map(|a| a.as_str()));
+        let mut pairs = Vec::new();
+        for t in toks {
+            let Some((k, v)) = t.split_once('=') else {
+                return false;
+            };
+            let ok = !k.is_empty()
+                && k.chars().enumerate().all(|(i, ch)| {
+                    ch == '_' || ch.is_ascii_alphabetic() || (i > 0 && ch.is_ascii_digit())
+                });
+            if !ok {
+                return false;
+            }
+            pairs.push((k.to_string(), v.to_string()));
+        }
+        for (k, v) in pairs {
+            let v = self.expand(&v);
+            if let Some(e) = self.env.iter_mut().find(|(ek, _)| *ek == k) {
+                e.1 = v;
+            } else {
+                self.env.push((k, v));
+            }
+        }
+        self.last_ok = true;
+        true
+    }
+
+    /// Execute parsed compound-command nodes. `last_ok` after a
+    /// condition block is the condition's value. Iteration-capped
+    /// loops prevent hung shells; `return` propagates via ret_flag.
+    fn exec_cnodes(&mut self, nodes: &[CNode]) {
+        const LOOP_CAP: usize = 100_000;
+        for n in nodes {
+            // brk/cont abort the rest of the current block — the
+            // innermost enclosing loop consumes and clears them.
+            if !self.running || self.ret_flag || self.brk_flag || self.cont_flag {
+                break;
+            }
+            match n {
+                CNode::Cmd(c) => self.execute(c),
+                CNode::If { arms, else_body } => {
+                    let mut matched = false;
+                    for (cond, body) in arms {
+                        self.exec_cnodes(cond);
+                        if self.ret_flag {
+                            break;
+                        }
+                        if self.last_ok {
+                            self.exec_cnodes(body);
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if !matched && !self.ret_flag {
+                        if let Some(b) = else_body {
+                            self.exec_cnodes(b);
+                        }
+                    }
+                }
+                CNode::For { var, items, body } => {
+                    let raw: Vec<String> = match items {
+                        Some(v) => v.clone(),
+                        None => self.params.clone(),
+                    };
+                    let list: Vec<String> = raw.into_iter().map(|s| self.expand(&s)).collect();
+                    for item in list {
+                        if !self.running || self.ret_flag {
+                            break;
+                        }
+                        // `for VAR` sets a shell variable (persists
+                        // after the loop, like POSIX).
+                        if let Some(e) = self.env.iter_mut().find(|(k, _)| *k == *var) {
+                            e.1 = item.clone();
+                        } else {
+                            self.env.push((var.clone(), item.clone()));
+                        }
+                        self.loop_depth += 1;
+                        self.exec_cnodes(body);
+                        self.loop_depth -= 1;
+                        if self.brk_flag {
+                            self.brk_flag = false;
+                            break;
+                        }
+                        if self.cont_flag {
+                            self.cont_flag = false;
+                            continue;
+                        }
+                    }
+                }
+                CNode::Loop { until, cond, body } => {
+                    let mut iters = 0usize;
+                    loop {
+                        if !self.running || self.ret_flag {
+                            break;
+                        }
+                        iters += 1;
+                        if iters > LOOP_CAP {
+                            self.emit("loop: iteration limit exceeded");
+                            self.last_ok = false;
+                            break;
+                        }
+                        self.exec_cnodes(cond);
+                        let go = if *until { !self.last_ok } else { self.last_ok };
+                        if !go || self.ret_flag {
+                            break;
+                        }
+                        self.loop_depth += 1;
+                        self.exec_cnodes(body);
+                        self.loop_depth -= 1;
+                        if self.brk_flag {
+                            self.brk_flag = false;
+                            break;
+                        }
+                        if self.cont_flag {
+                            self.cont_flag = false;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Invoke a user function: save/restore positional params, track
@@ -3896,5 +4349,90 @@ mod tests {
         sh.run();
         let o = out.borrow();
         assert!(o.contains("> custom-hi\n"), "OUT: {o}");
+    }
+
+    #[test]
+    fn compound_if() {
+        let (mut sh, out) = shell(&[
+            "if true; then echo yes; fi",
+            "if false; then echo no; else echo other; fi",
+            "if false; then echo a; elif true; then echo b; else echo c; fi",
+            "if [ -f /tmp/multi ]; then echo isfile; fi",
+            "exit",
+        ]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("> yes\n"), "OUT: {o}");
+        assert!(o.contains("> other\n"), "OUT: {o}");
+        assert!(o.contains("> b\n"), "OUT: {o}");
+        assert!(o.contains("> isfile\n"), "OUT: {o}");
+        assert!(!o.contains("> no\n"), "OUT: {o}");
+        assert!(!o.contains("> a\n"), "OUT: {o}");
+        assert!(!o.contains("> c\n"), "OUT: {o}");
+    }
+
+    #[test]
+    fn compound_for() {
+        let (mut sh, out) = shell(&[
+            "for x in a b c; do echo got-$x; done",
+            "for x in one \"two words\"; do echo [$x]; done",
+            "exit",
+        ]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("got-a\n"), "OUT: {o}");
+        assert!(o.contains("got-c\n"), "OUT: {o}");
+        assert!(o.contains("[one]\n"), "OUT: {o}");
+        assert!(o.contains("[two words]\n"), "OUT: {o}");
+    }
+
+    #[test]
+    fn compound_loops_zero_iter() {
+        let (mut sh, out) = shell(&[
+            "while false; do echo never; done",
+            "until true; do echo never2; done",
+            "echo after",
+            "exit",
+        ]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("> after\n"), "OUT: {o}");
+        assert!(!o.contains("never"), "OUT: {o}");
+    }
+
+    #[test]
+    fn compound_nested_and_trailing() {
+        let (mut sh, out) = shell(&[
+            "if true; then for x in p q; do echo $x; done; fi",
+            "if true; then echo y; fi; echo tail",
+            "exit",
+        ]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("p\n"), "OUT: {o}");
+        assert!(o.contains("q\n"), "OUT: {o}");
+        assert!(o.contains("y\n"), "OUT: {o}");
+        assert!(o.contains("tail\n"), "OUT: {o}");
+    }
+
+    #[test]
+    fn compound_break_continue_assign() {
+        let (mut sh, out) = shell(&[
+            "n=0",
+            "for x in a b c d; do if [ $x = c ]; then break; fi; echo saw-$x; done",
+            "for x in 1 2 3; do if [ $x = 2 ]; then continue; fi; echo kept-$x; done",
+            "v=hello w=world",
+            "echo $v-$w",
+            "exit",
+        ]);
+        sh.run();
+        let o = out.borrow();
+        assert!(o.contains("saw-a"), "OUT: {o}");
+        assert!(o.contains("saw-b"), "OUT: {o}");
+        assert!(!o.contains("saw-c"), "OUT: {o}");
+        assert!(o.contains("kept-1"), "OUT: {o}");
+        assert!(!o.contains("kept-2"), "OUT: {o}");
+        assert!(o.contains("kept-3"), "OUT: {o}");
+        assert!(o.contains("hello-world"), "OUT: {o}");
     }
 }
