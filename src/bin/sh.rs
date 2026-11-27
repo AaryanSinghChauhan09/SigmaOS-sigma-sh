@@ -288,6 +288,10 @@ impl System for SysSystem {
         sys::api::wait(pid as u64).map_err(|e| format!("wait failed ({})", e))
     }
 
+    fn wait_any(&self) -> Result<i64, String> {
+        sys::api::wait_any().map_err(|e| format!("wait failed ({})", e))
+    }
+
     fn uptime(&self) -> u64 {
         tsc() / TSC_HZ
     }

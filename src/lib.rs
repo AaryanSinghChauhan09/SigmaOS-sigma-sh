@@ -123,6 +123,11 @@ pub trait System {
     fn wait(&self, _pid: i64) -> Result<i64, String> {
         Err("wait: unsupported".into())
     }
+    /// Wait for ANY child to exit; returns its exit status.
+    /// Default: unsupported.
+    fn wait_any(&self) -> Result<i64, String> {
+        Err("wait: unsupported".into())
+    }
     /// Current uptime seconds.
     fn uptime(&self) -> u64;
     /// Sleep for `secs` seconds. Default: no-op.
@@ -4149,9 +4154,19 @@ where
         }
     }
 
-    /// `wait [pid]` — block until a child exits; bare `wait` uses the
-    /// most recently launched pid.
+    /// `wait [pid]` — block until a child exits; bare `wait` waits for
+    /// ANY child (POSIX), falling back to the most recent pid where
+    /// wait-any is unsupported (host builds).
     fn cmd_wait(&mut self, args: &[String]) {
+        if args.is_empty() {
+            match self.sys.wait_any() {
+                Ok(status) => {
+                    self.emit(&format!("wait: child exited {}", status));
+                    return;
+                }
+                Err(_) => {}
+            }
+        }
         let pid = match args.first() {
             Some(s) => match s.parse::<i64>() {
                 Ok(p) => p,
