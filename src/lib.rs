@@ -419,6 +419,116 @@ impl<'a> CParser<'a> {
     }
 }
 
+// ── arithmetic expansion $(( ... )) ───────────────────────────────
+
+/// Evaluate a POSIX-style arithmetic expression: + - * / %, unary
+/// minus, parens, integer literals, and env-var names (non-numeric
+/// or unset evaluate to 0). Division by zero yields 0.
+fn arith_eval(expr: &str, env: &[(String, String)]) -> String {
+    struct P<'a> {
+        t: Vec<char>,
+        i: usize,
+        env: &'a [(String, String)],
+    }
+    impl<'a> P<'a> {
+        fn ws(&mut self) {
+            while self.i < self.t.len() && self.t[self.i].is_whitespace() {
+                self.i += 1;
+            }
+        }
+        fn peek(&mut self) -> Option<char> {
+            self.ws();
+            self.t.get(self.i).copied()
+        }
+        fn eat(&mut self, c: char) -> bool {
+            if self.peek() == Some(c) {
+                self.i += 1;
+                true
+            } else {
+                false
+            }
+        }
+        fn expr(&mut self) -> i64 {
+            let mut v = self.term();
+            loop {
+                if self.eat('+') {
+                    v += self.term();
+                } else if self.eat('-') {
+                    v -= self.term();
+                } else {
+                    return v;
+                }
+            }
+        }
+        fn term(&mut self) -> i64 {
+            let mut v = self.factor();
+            loop {
+                if self.eat('*') {
+                    v = v.wrapping_mul(self.factor());
+                } else if self.eat('/') {
+                    let d = self.factor();
+                    v = if d == 0 { 0 } else { v.wrapping_div(d) };
+                } else if self.eat('%') {
+                    let d = self.factor();
+                    v = if d == 0 { 0 } else { v.wrapping_rem(d) };
+                } else {
+                    return v;
+                }
+            }
+        }
+        fn factor(&mut self) -> i64 {
+            self.ws();
+            if self.eat('-') {
+                return -self.factor();
+            }
+            if self.eat('+') {
+                return self.factor();
+            }
+            if self.eat('(') {
+                let v = self.expr();
+                self.eat(')');
+                return v;
+            }
+            if self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                let mut n: i64 = 0;
+                while let Some(c) = self.peek() {
+                    if let Some(d) = c.to_digit(10) {
+                        n = n.wrapping_mul(10).wrapping_add(d as i64);
+                        self.i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                return n;
+            }
+            // variable name
+            let mut name = String::new();
+            while let Some(c) = self.peek() {
+                if c == '_' || c.is_ascii_alphanumeric() {
+                    name.push(c);
+                    self.i += 1;
+                } else {
+                    break;
+                }
+            }
+            if name.is_empty() {
+                return 0;
+            }
+            self.env
+                .iter()
+                .find(|(k, _)| *k == name)
+                .and_then(|(_, v)| v.trim().parse::<i64>().ok())
+                .unwrap_or(0)
+        }
+    }
+    let mut p = P {
+        t: expr.chars().collect(),
+        i: 0,
+        env,
+    };
+    p.expr().to_string()
+}
+
 /// Quote-aware word split for `for ... in` item lists. Returns
 /// (word, quoted-mask) pairs; quotes are stripped.
 fn split_items(s: &str) -> Vec<String> {
@@ -489,6 +599,12 @@ pub fn parse(line: &str) -> Option<Command> {
                 in_squote = !in_squote;
                 cur_q |= 1;
             }
+            // Inside a substitution, ALL parens count toward depth —
+            // `$(( ))` arithmetic and subshell `( )` nest correctly.
+            '(' if !in_dquote && !in_squote && sub_depth > 0 && !opens_sub => {
+                sub_depth += 1;
+                cur.push(c);
+            }
             ')' if !in_dquote && !in_squote && sub_depth > 0 => {
                 sub_depth -= 1;
                 cur.push(c);
@@ -531,6 +647,12 @@ pub fn parse_pipeline(line: &str) -> Option<Pipeline> {
             }
             '\'' if !in_dquote => {
                 in_squote = !in_squote;
+                cur.push(c);
+            }
+            // Inside a substitution, ALL parens count toward depth —
+            // `$(( ))` arithmetic and subshell `( )` nest correctly.
+            '(' if !in_dquote && !in_squote && sub_depth > 0 && !opens_sub => {
+                sub_depth += 1;
                 cur.push(c);
             }
             ')' if !in_dquote && !in_squote && sub_depth > 0 => {
@@ -583,6 +705,12 @@ pub fn split_semicolons(line: &str) -> Vec<String> {
                 in_squote = !in_squote;
                 cur.push(c);
             }
+            // Inside a substitution, ALL parens count toward depth —
+            // `$(( ))` arithmetic and subshell `( )` nest correctly.
+            '(' if !in_dquote && !in_squote && sub_depth > 0 && !opens_sub => {
+                sub_depth += 1;
+                cur.push(c);
+            }
             ')' if !in_dquote && !in_squote && sub_depth > 0 => {
                 sub_depth -= 1;
                 cur.push(c);
@@ -626,6 +754,12 @@ pub fn split_and(line: &str) -> Vec<String> {
             }
             '\'' if !in_dquote => {
                 in_squote = !in_squote;
+                cur.push(c);
+            }
+            // Inside a substitution, ALL parens count toward depth —
+            // `$(( ))` arithmetic and subshell `( )` nest correctly.
+            '(' if !in_dquote && !in_squote && sub_depth > 0 && !opens_sub => {
+                sub_depth += 1;
                 cur.push(c);
             }
             ')' if !in_dquote && !in_squote && sub_depth > 0 => {
@@ -693,6 +827,12 @@ pub fn split_or(line: &str) -> Vec<String> {
             }
             '\'' if !in_dquote => {
                 in_squote = !in_squote;
+                cur.push(c);
+            }
+            // Inside a substitution, ALL parens count toward depth —
+            // `$(( ))` arithmetic and subshell `( )` nest correctly.
+            '(' if !in_dquote && !in_squote && sub_depth > 0 && !opens_sub => {
+                sub_depth += 1;
                 cur.push(c);
             }
             ')' if !in_dquote && !in_squote && sub_depth > 0 => {
@@ -1333,6 +1473,36 @@ where
         while i < chars.len() {
             if chars[i] != '$' {
                 out.push(chars[i]);
+                i += 1;
+                continue;
+            }
+            // `$(( expr ))` — arithmetic expansion. Checked before
+            // `$(...)` since it also starts with `$(`.
+            if i + 2 < chars.len() && chars[i + 1] == '(' && chars[i + 2] == '(' {
+                let mut j = i + 3;
+                let mut d = 0i32;
+                let mut end = None;
+                while j + 1 < chars.len() {
+                    match chars[j] {
+                        '(' => d += 1,
+                        ')' => {
+                            if d == 0 && chars[j + 1] == ')' {
+                                end = Some(j);
+                                break;
+                            }
+                            d -= 1;
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                if let Some(e) = end {
+                    let expr: String = chars[i + 3..e].iter().collect();
+                    out.push_str(&arith_eval(&expr, &self.env));
+                    i = e + 2;
+                    continue;
+                }
+                out.push('$');
                 i += 1;
                 continue;
             }
@@ -4434,5 +4604,25 @@ mod tests {
         assert!(!o.contains("kept-2"), "OUT: {o}");
         assert!(o.contains("kept-3"), "OUT: {o}");
         assert!(o.contains("hello-world"), "OUT: {o}");
+    }
+
+    #[test]
+    fn arith_expansion() {
+        let (mut sh, out) = shell(&[
+            "echo $((1+2*3))",
+            "echo $(( (1+2)*3 ))",
+            "x=5",
+            "echo $((x*2+1))",
+            "echo $((-7 % 3))",
+            "i=0",
+            "while [ $i -lt 3 ]; do echo n=$i; i=$((i+1)); done",
+            "exit",
+        ]);
+        sh.run();
+        let o = out.borrow();
+        for want in ["7", "9", "11", "-1", "n=0", "n=1", "n=2"] {
+            assert!(o.contains(want), "missing {want} OUT: {o}");
+        }
+        assert!(!o.contains("n=3"), "OUT: {o}");
     }
 }
