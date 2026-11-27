@@ -4747,13 +4747,13 @@ where
         let path = self.resolve(args.first());
         match self.sys.statfs(&path) {
             Some((kind, nodes)) => {
-                let name = match kind {
-                    1 => "initramfs",
-                    2 => "fat32",
-                    _ => "other",
-                };
                 self.emit("Filesystem     Type       Files");
-                self.emit(&format!("{:<14} {:<10} {}", path, name, nodes));
+                self.emit(&format!(
+                    "{:<14} {:<10} {}",
+                    path,
+                    fs_kind_name(kind),
+                    nodes
+                ));
             }
             None => {
                 self.emit("df: statfs unsupported");
@@ -4769,12 +4769,7 @@ where
                 Some(mounts) => {
                     self.emit("Filesystem     Type");
                     for (path, kind, _dev) in mounts {
-                        let name = match kind {
-                            1 => "initramfs",
-                            2 => "fat32",
-                            _ => "other",
-                        };
-                        self.emit(&format!("{:<14} {}", path, name));
+                        self.emit(&format!("{:<14} {}", path, fs_kind_name(kind)));
                     }
                 }
                 None => {
@@ -5076,6 +5071,16 @@ const BUILTIN_NAMES: &[&str] = &[
     "time", "times", "touch", "tr", "true", "tty", "umount", "unalias", "uname", "unexpand",
     "uniq", "unset", "uptime", "wait", "wc", "which", "whoami", "xargs", "yes",
 ];
+
+/// Kernel FsKind code -> display name (1=initramfs, 2=fat32, 4=proc).
+fn fs_kind_name(kind: u64) -> &'static str {
+    match kind {
+        1 => "initramfs",
+        2 => "fat32",
+        4 => "proc",
+        _ => "other",
+    }
+}
 
 fn is_builtin(name: &str) -> bool {
     BUILTIN_NAMES.contains(&name)
